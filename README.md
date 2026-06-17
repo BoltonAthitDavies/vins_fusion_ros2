@@ -21,8 +21,8 @@ components:
 1. [Problem statement](#1-problem-statement)
 2. [Environment setup](#2-environment-setup)
 3. [Ego vehicle](#3-ego-vehicle-kinematics-state-input-sensors)
-4. [SLAM (VINS-Fusion): setup, experiment, results, analysis](#4-slam-vins-fusion)
-5. [MPC: setup & method](#5-mpc-model-predictive-control)
+4. [SLAM (VINS-Fusion): equations, online/offline/live setup, results, analysis](#4-slam-vins-fusion)
+5. [MPC: equations & method](#5-mpc-model-predictive-control)
 6. [Traffic-light detection](#6-traffic-light-detection)
 7. [Integration (SLAM + MPC + traffic light)](#7-integration)
 8. [Conclusion & discussion](#8-conclusion--discussion)
@@ -136,27 +136,133 @@ v   += a · dt
 
 ## 4. SLAM (VINS-Fusion)
 
-### 4.1 Setup
+### 4.1 Formulation — the equations
 
-Four estimator variants, each run **5 times** per scene, across **three evaluation paths**:
+VINS-Fusion is a **tightly-coupled, optimization-based** estimator: pose estimation = minimizing a
+sum of Mahalanobis residuals over a sliding window of recent keyframes (it is **not** a filter).
 
-| Variant | Sensors |
-|---------|---------|
-| `stereo` | stereo cameras only (VO) |
-| `stereo+imu` | stereo + IMU (VIO) |
-| `stereo+gps` | stereo VO fused with GPS via `global_fusion` |
-| `stereo+imu+gps` | stereo+IMU fused with GPS |
+**State** — sliding window of `n+1` keyframes and `m` features:
 
-| Path | How | Properties |
-|------|-----|-----------|
-| **online** | `ros2 bag play … --clock` | what you'd get live; timing-dependent |
-| **offline** | `vins_bag_reader` (direct rosbag read) | **~10× faster, bit-deterministic** |
-| **live** | native CARLA, real-time C++ node | the real target; runs all variants as observers |
+```
+X   = [ x_0, x_1, …, x_n,  x_c,  λ_0, …, λ_m ]
+x_k = [ p^w_{b_k},  v^w_{b_k},  q^w_{b_k},  b_a,  b_g ]   # pos, vel, orientation, accel-bias, gyro-bias
+x_c = [ p^b_c, q^b_c ]                                    # camera↔IMU extrinsic
+λ_l = inverse depth of feature l
+```
 
-Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metric = **APE RMSE** (Umeyama-aligned) and
-**5-run spread** (run-to-run determinism); `DIV` = diverged (> 10⁴ m).
+**Cost** — maximum-a-posteriori over three residual groups (prior + IMU + vision):
 
-### 4.2 Results
+```
+min_X  {  ‖ r_p − H_p·X ‖²                                 # marginalization prior (drop-out keyframe)
+        + Σ_{k∈B}     ‖ r_B( ẑ_{b_k b_{k+1}}, X ) ‖²_{P_B}   # IMU preintegration
+        + Σ_{(l,j)∈C} ‖ r_C( ẑ^{c_j}_l,      X ) ‖²_{P_C} }  # visual reprojection
+```
+
+**IMU preintegration residual** `r_B` (couples two keyframes via preintegrated α̂, β̂, γ̂; `g^w` =
+gravity). This is the block that fails on CARLA — see §4.5:
+
+```
+r_B = [ R^{b_k}_w ( p^w_{b_{k+1}} − p^w_{b_k} − v^w_{b_k}·Δt + ½·g^w·Δt² )  − α̂
+        R^{b_k}_w ( v^w_{b_{k+1}} − v^w_{b_k} + g^w·Δt )                    − β̂
+        2·[ (γ̂)^{-1} ⊗ (q^w_{b_k})^{-1} ⊗ q^w_{b_{k+1}} ]_xyz
+        b_a,{k+1} − b_a,k
+        b_g,{k+1} − b_g,k ]
+```
+
+**Visual reprojection residual** `r_C` (feature `l` first seen in frame `i`, re-observed in frame `j`):
+back-project with its inverse depth `λ_l`, transport `i→j` through the poses, compare to the measured
+pixel `u^{c_j}_l`:
+
+```
+r_C = u^{c_j}_l  −  π( T^c_b · T^{b_j}_w · T^w_{b_i} · T^b_c · (1/λ_l)·u^{c_i}_l )
+```
+
+**GPS fusion (`global_fusion`)** is a *second*, looser stage: a pose graph (Ceres,
+[`global_fusion/src/Factors.h`](../global_fusion/src/Factors.h)) that fuses the VIO trajectory with
+global GPS fixes. Two factor types:
+
+```
+GPS position  (TError):       r_T = ( t_j − t_gps ) / σ_gps                          # 3-dim, absolute
+VIO relative  (RelativeRTError):
+   r_t = [ R(q_i)^{-1}·( t_j − t_i ) − t̂_ij ] / σ_t                                  # 3-dim
+   r_q = 2·[ q̂_ij^{-1} ⊗ ( q_i^{-1} ⊗ q_j ) ]_xyz / σ_q                              # 3-dim
+```
+
+The GPS factor anchors **absolute** position (kills long-term drift); the relative factor preserves
+the locally-smooth VIO **shape**. This is exactly why the GPS variants stay bounded where pure VO/VIO
+drift away.
+
+### 4.2 Experiment setup
+
+Four estimator variants, each run **5 times** per scene, across **three data paths** (§4.3):
+
+| Variant | Sensors | Pipeline |
+|---------|---------|----------|
+| `stereo` | stereo cameras only | VINS visual odometry |
+| `stereo+imu` | stereo + IMU | VINS visual-inertial odometry |
+| `stereo+gps` | stereo + GPS | VINS VO → `global_fusion` pose graph |
+| `stereo+imu+gps` | stereo + IMU + GPS | VINS VIO → `global_fusion` pose graph |
+
+Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metrics = **APE RMSE** (Umeyama-aligned absolute
+trajectory error) and **5-run spread** (run-to-run determinism); `DIV` = diverged (> 10⁴ m).
+
+### 4.3 Online vs offline vs live — setup, data flow, timeflow
+
+The **same VINS code** runs in all three. What differs is *how* the stereo/IMU/GPS streams reach it
+and *which clock* drives time — and that alone changes determinism, speed, and what the result means.
+
+|  | **online** | **offline** | **live** |
+|--|-----------|------------|----------|
+| Data source | recorded rosbag | recorded rosbag | live CARLA server |
+| Clock (time base) | wall-clock × rate, via `/clock` | message `header.stamp` | CARLA sim tick |
+| Delivery | async DDS pub/sub (**lossy**) | synchronous, in-order (**lossless**) | synchronous sensor callbacks |
+| Speed | real-time (1×) | **~10× faster** | real-time |
+| Determinism | **no** (timing-dependent) | **yes** (bit-identical) | yes (after camera-swap + rate fix) |
+| What it means | what you'd get live | best-case accuracy ceiling | the real closed-loop system |
+
+**Online** — `ros2 bag play` republishes topics at wall-clock × rate; VINS subscribes over DDS. If
+the estimator can't keep up, frames are **dropped**, and which ones drop varies run-to-run → the
+non-determinism seen in §4.4.
+
+```
+ rosbag ──ros2 bag play --clock -r 1.0──▶ /clock  (time = wall-clock × rate)
+                                        ├▶ /cam_front_left, /cam_front_right ┐
+                                        ├▶ /imu                              ├─DDS pub/sub─▶ VINS node ─▶ /…/odometry
+                                        └▶ /gnss                             ┘   ▲
+                                                                  if VINS lags, frames DROP here (lossy)
+```
+
+**Offline** — `vins_bag_reader` opens the bag with `rosbag2_cpp::SequentialReader` and feeds **every**
+message straight into VINS in `header.stamp` order. Nothing is dropped, time comes from the stamps,
+and with the RANSAC RNG seeded the result is **bit-identical** every run and ~10× faster than playback.
+
+```
+ rosbag ──SequentialReader (direct read)──▶ messages in header.stamp order
+                                            └─ hand EACH frame directly into VINS ─▶ CSV
+   time = header.stamp · no DDS · no drops · seeded RANSAC ⇒ bit-identical, ~10× real-time
+```
+
+**Live** — the native CARLA C++ node runs the simulator in **synchronous mode**: each `tick()`
+advances sim time by Δt and produces the due sensor frames in-process; VINS estimates the state, the
+MPC turns it into a `VehicleControl`, that is applied, and the **next** tick is requested. The
+estimate is in the control loop — the only path where SLAM error actually affects where the car goes.
+
+```
+ CARLA server (sync, 200 Hz tick)
+   tick() ─▶ stereo@20Hz · IMU@200Hz · GNSS@10Hz ─in-process─▶ VINS ─▶ state {x,y,yaw,v}
+                                                                         │
+                          VehicleControl{throttle,steer,brake} ◀─ MPC ◀─┘
+                                          │
+                                          └──▶ apply, then request next tick()   (closed loop)
+   time = sim clock · estimate feeds control feeds the next sensor frame
+```
+
+**Timeflow takeaway.** Online and offline **replay the same recorded data**, so offline is the
+*accuracy ceiling* (lossless + deterministic) and online is *what you'd actually get live* under
+timing jitter. Live is the real system, where the estimate also steers — so a divergence there (the
+IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or control.
+
+### 4.4 Results
 
 **`town01_normal`** — easy baseline (APE RMSE [m] / 5-run spread [m]):
 
@@ -193,7 +299,7 @@ Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metric = **APE RMSE** (Umeya
 |---|---|
 | ![direct town01](figures/track_direct_town01_normal.png) | ![direct alwaysrun](figures/track_direct_town10_alwaysrun.png) |
 
-### 4.3 Analysis — key findings
+### 4.5 Analysis — key findings
 
 1. **GPS is the single biggest accuracy win.** On every normal-speed scene the GPS variants are the
    most accurate (sub-metre offline/live), and they stay bounded where pure VO/VIO diverges.
@@ -224,17 +330,59 @@ Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metric = **APE RMSE** (Umeya
 
 ## 5. MPC (Model-Predictive Control)
 
-> *Experiment / result / analysis: **to be added.*** This section documents the method as implemented.
+> *Experiment / result / analysis: **to be added.*** This section documents the method + equations as
+> implemented in [`mpc.hpp`](src/carla_cpp/mpc.hpp).
 
-A **sampling (brute-force) MPC** in `mpc.hpp`. Each control cycle it evaluates a small grid of
-candidate inputs and keeps the lowest-cost one:
+A **sampling (brute-force) MPC**. Each control cycle it rolls a kinematic bicycle model forward over
+the horizon for a small grid of candidate `(steer, accel)` pairs, scores each rollout, and applies the
+lowest-cost one. No gradient solver — just enumerate, simulate, pick the best.
 
-- **Candidates:** 7 steering offsets × 6 acceleration levels = **42 bicycle-model rollouts** per cycle.
-- **Horizon:** 100 steps × 0.10 s = 10 s (configurable via `horizon:=`).
-- **Cost:** lookahead-weighted sum of position error + line-of-sight heading + terminal heading +
-  speed-tracking error, plus steering / Δsteering / acceleration regularizers. Steering is
-  rate-limited and low-pass filtered to prevent chatter.
-- **Defaults:** `target_speed` 3.5 m/s (raise to ~5.5 for autopilot-recorded GT), wheelbase 2.875 m.
+**1. Bicycle-model rollout** — per candidate, `H` steps, `dt = 0.10 s`, wheelbase `L = 2.875 m`,
+`δ_max = 0.60 rad`. State is `(x, y, ψ, v)` in ROS/ENU:
+
+```
+v_{t+1} = clamp( v_t + a·dt,  0,  v_max=8 )
+x_{t+1} = x_t + v_{t+1}·cos(ψ_t)·dt
+y_{t+1} = y_t + v_{t+1}·sin(ψ_t)·dt
+ψ_{t+1} = ψ_t + (v_{t+1}/L)·tan(δ·δ_max)·dt
+```
+
+**2. Candidate set** — 7 steer × 6 accel = **42 rollouts** per cycle:
+
+```
+δ ∈ δ_prev + {−0.30, −0.18, −0.09, 0, +0.09, +0.18, +0.30}     (clamped |δ| ≤ 0.65)
+a ∈ { −a_dec, −½a_dec, a_desired, 0, +½a_acc, +a_acc }          (a_acc = 2, a_dec = 4 m/s²)
+   a_desired = clamp( (v_target − v) / (H·dt),  −a_dec,  a_acc )
+```
+
+**3. Cost** (minimized over the 42 candidates):
+
+```
+J =  0.12·δ²  +  1.2·(δ − δ_prev)²  +  0.04·( a / (a_acc + a_dec) )²        ← input regularizers
+   + Σ_{t=1..H} [ (1 + 0.08·t)·1.8·d_t²                                      ← lookahead-weighted position
+                  + 1.2·e_los,t²                                            ← align heading to line-of-sight
+                  + 0.25·e_tgt,t²                                           ← match terminal heading θ_target
+                  + 0.45·(v_t − v_target)² ]                                ← speed tracking
+   + 3.0·d_H²                                                               ← heavy terminal pull
+```
+
+where `d_t` = distance to the target point, `e_los,t = atan2(Δy,Δx) − ψ_t` (line-of-sight heading
+error), `e_tgt,t = θ_target − ψ_t` (terminal-heading error). The `(1 + 0.08·t)` factor makes later
+steps count more (lookahead); the `3.0·d_H²` term strongly pulls the final pose onto the target.
+
+**4. Control mapping → CARLA** (the winning `δ*, a*`):
+
+```
+v_target = min( target_speed,  √( 2·a_dec·(dist − goal_tol) ) )            goal_tol = 0.75 m
+steer    = smooth( −δ* )         # ENU→CARLA sign flip, rate-limited 1.8/s, α=0.35 low-pass
+throttle = clamp( 0.10 + 0.20·a* + 0.04·(v_target − v),  0,  0.45 )        if a* ≥ 0
+brake    = clamp( −a* / a_dec,  0,  1 )                                    if a* < 0
+```
+
+The `v_target` braking-distance cap makes the car slow smoothly into the goal; within `goal_tol` it
+brakes to a stop. Defaults: `target_speed` 3.5 m/s (raise to ~5.5 to match autopilot-recorded GT),
+horizon 100 steps = 10 s (tune `horizon ≈ lookahead / target_speed` so the rollout reaches the target
+without overshooting).
 
 **Driving the MPC on a VINS state (bootstrap + handover).** Because a VINS estimate is not available
 at t = 0 (and lives in a different frame from the recorded path), the MPC first drives on
