@@ -158,9 +158,7 @@ $$
 dropped-out keyframe), the IMU preintegration terms, and the visual reprojection terms:
 
 $$
-\min_{\mathcal{X}} \left\{\; \lVert r_p - H_p\,\mathcal{X} \rVert^2
-\;+\; \sum_{k \in \mathcal{B}} \big\lVert r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \big\rVert^2_{P_{\mathcal{B}}}
-\;+\; \sum_{(l,j) \in \mathcal{C}} \big\lVert r_{\mathcal{C}}(\hat{z}^{\,c_j}_l,\, \mathcal{X}) \big\rVert^2_{P_{\mathcal{C}}} \;\right\}
+\min_{\mathcal{X}} \left\{ \left\lVert r_p - H_p\,\mathcal{X} \right\rVert^{2} + \sum_{k \in \mathcal{B}} \left\lVert r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \right\rVert_{P_{\mathcal{B}}}^{2} + \sum_{(l,j) \in \mathcal{C}} \left\lVert r_{\mathcal{C}}(\hat{z}_{l}^{c_j},\, \mathcal{X}) \right\rVert_{P_{\mathcal{C}}}^{2} \right\}
 $$
 
 **IMU preintegration residual** $r_{\mathcal{B}}$ couples two keyframes through the preintegrated
@@ -172,7 +170,7 @@ r_{\mathcal{B}} =
 \begin{bmatrix}
 R^{b_k}_w\big(p^w_{b_{k+1}} - p^w_{b_k} - v^w_{b_k}\Delta t + \tfrac{1}{2}g^w \Delta t^2\big) - \hat{\alpha} \\[2pt]
 R^{b_k}_w\big(v^w_{b_{k+1}} - v^w_{b_k} + g^w \Delta t\big) - \hat{\beta} \\[2pt]
-2\,\big[\, \hat{\gamma}^{-1} \otimes (q^w_{b_k})^{-1} \otimes q^w_{b_{k+1}} \,\big]_{xyz} \\[2pt]
+2\left[\, \hat{\gamma}^{-1} \otimes (q^w_{b_k})^{-1} \otimes q^w_{b_{k+1}} \,\right]_{xyz} \\[2pt]
 b_{a,k+1} - b_{a,k} \\[2pt]
 b_{g,k+1} - b_{g,k}
 \end{bmatrix}
@@ -194,7 +192,7 @@ VIO relative-pose factor (`RelativeRTError`):
 $$
 r_T = \frac{t_j - t_{\text{gps}}}{\sigma_{\text{gps}}}, \qquad
 r_t = \frac{R(q_i)^{-1}\,(t_j - t_i) - \hat{t}_{ij}}{\sigma_t}, \qquad
-r_q = \frac{2\,\big[\, \hat{q}_{ij}^{-1} \otimes (q_i^{-1} \otimes q_j) \,\big]_{xyz}}{\sigma_q}
+r_q = \frac{2\left[\, \hat{q}_{ij}^{-1} \otimes (q_i^{-1} \otimes q_j) \,\right]_{xyz}}{\sigma_q}
 $$
 
 The GPS factor anchors **absolute** position (kills long-term drift); the relative factor preserves
