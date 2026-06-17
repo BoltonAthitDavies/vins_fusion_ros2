@@ -158,7 +158,7 @@ $$
 dropped-out keyframe), the IMU preintegration terms, and the visual reprojection terms:
 
 $$
-\min_{\mathcal{X}} \left\{ \left\| r_p - H_p\,\mathcal{X} \right\|^{2} + \sum_{k \in \mathcal{B}} \left\| r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \right\|_{P_{\mathcal{B}}}^{2} + \sum_{(l,j) \in \mathcal{C}} \left\| r_{\mathcal{C}}(\hat{z}_{l}^{c_j},\, \mathcal{X}) \right\|_{P_{\mathcal{C}}}^{2} \right\}
+\min_{\mathcal{X}} \, \{\, \| r_p - H_p\,\mathcal{X} \|^{2} + \sum_{k \in \mathcal{B}} \| r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \|_{P_{\mathcal{B}}}^{2} + \sum_{(l,j) \in \mathcal{C}} \| r_{\mathcal{C}}(\hat{z}_{l}^{c_j},\, \mathcal{X}) \|_{P_{\mathcal{C}}}^{2} \,\}
 $$
 
 **IMU preintegration residual** $r_{\mathcal{B}}$ couples two keyframes through the preintegrated
@@ -390,10 +390,12 @@ $$
 v_{\text{target}} = \min\!\left( v_c,\; \sqrt{2\,a_{\text{dec}}\,(d - d_{\text{tol}})} \right)
 $$
 
+When $a^{*} \ge 0$ the controller throttles, otherwise it brakes:
+
 $$
 \text{steer} = \mathrm{smooth}(-\delta^{*}), \qquad
-\text{throttle} = \mathrm{clamp}\!\left( 0.10 + 0.20\,a^{*} + 0.04\,(v_{\text{target}} - v),\; 0,\; 0.45 \right)\ \ (a^{*} \ge 0), \qquad
-\text{brake} = \mathrm{clamp}\!\left( \frac{-a^{*}}{a_{\text{dec}}},\; 0,\; 1 \right)\ \ (a^{*} < 0)
+\text{throttle} = \mathrm{clamp}(\, 0.10 + 0.20\,a^{*} + 0.04\,(v_{\text{target}} - v),\ 0,\ 0.45 \,), \qquad
+\text{brake} = \mathrm{clamp}(\, -a^{*}/a_{\text{dec}},\ 0,\ 1 \,)
 $$
 
 The $v_{\text{target}}$ braking-distance cap makes the car slow smoothly into the goal; within `goal_tol` it
