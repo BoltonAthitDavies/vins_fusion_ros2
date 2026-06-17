@@ -1,0 +1,133 @@
+################### Athit vins  ####################### 
+-- colcon build --
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+export LD_LIBRARY_PATH=/home/fibo3/local/lib:$LD_LIBRARY_PATH   # CUDA OpenCV 4.10 (needed at link + runtime)
+colcon build --packages-select vins_fusion_ros2 global_fusion --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash   # re-source after every build
+
+or 
+
+colcon build --packages-select vins_fusion_ros2 && source install/setup.bash
+
+
+########-- method 1 : rosbag --########
+# terminal A stereo
+source install/setup.bash && ros2 run vins_fusion_ros2 vins_fusion_ros2_node --ros-args -r __node:=vins_stereo \
+  -p use_sim_time:=true -p config_file:=$PWD/src/config/carla/carla_stereo.yaml \
+  -r odometry:=/vins_stereo/odometry \
+  -p output_path:=$PWD/output_rosbag/stereo2
+
+# terminal B stereo+imu
+source install/setup.bash && ros2 run vins_fusion_ros2 vins_fusion_ros2_node --ros-args -r __node:=vins_stereo_imu \
+  -p use_sim_time:=true -p config_file:=$PWD/src/config/carla/carla_stereo_imu.yaml \
+  -r odometry:=/vins_stereo_imu/odometry \
+  -p output_path:=$PWD/output_rosbag/stereo_imu2
+
+# terminal C stereo+gps
+source install/setup.bash && ros2 run global_fusion global_fusion_node --ros-args -r __node:=gfus_stereo \
+  -p use_sim_time:=true \
+  -r /vins_estimator/odometry:=/vins_stereo/odometry \
+  -r /gps:=/carla/ego_vehicle/gnss \
+  -r global_odometry:=/vins_stereo_gps/odometry \
+  -p output_csv:=$PWD/output_rosbag/stereo_gps2/vio.csv
+
+# terminal D stereo+imu+gps
+source install/setup.bash && ros2 run global_fusion global_fusion_node --ros-args -r __node:=gfus_stereo_imu \
+  -p use_sim_time:=true \
+  -r /vins_estimator/odometry:=/vins_stereo_imu/odometry \
+  -r /gps:=/carla/ego_vehicle/gnss \
+  -r global_odometry:=/vins_stereo_imu_gps/odometry \
+  -p output_csv:=$PWD/output_rosbag/stereo_imu_gps2/vio.csv
+
+# terminal E rtab
+source install/setup.bash && ros2 launch vins_fusion_ros2 carla_bag_rtab.launch.py \
+  bag_path:=~/ros2_ws/rosbag2_2026_06_06-17_15_44_noimunoise \
+  direct:=false \
+  config_path:=src/config/carla/carla_stereo.yaml
+  
+# 2. view it
+~/ros2_ws/rtab_tool/view_db.sh ~/rtab_carla.db   # Edit → View 3D Map…
+
+# terminal F
+ros2 bag play rosbag2_2026_06_07-11_29_12_town01_drivenormal --clock -r 1.0
+ros2 bag play rosbag2_2026_06_06-17_15_44_noimunoise --clock -r 1.0
+ros2 bag play rosbag2_2026_06_06-15_54_52_alwaysdrive --clock -r 1.0
+ros2 bag play rosbag2_2026_06_06-21_15_27_noimunoise_driveslow --clock -r 1.0
+
+
+########-- method 2 : directed read --########
+# terminal A : BAG=rosbag2_2026_06_06-17_15_44_noimunoise, rosbag2_2026_06_07-11_29_12_town01_drivenormal, rosbag2_2026_06_06-15_54_52_alwaysdrive
+BR=install/vins_fusion_ros2/lib/vins_fusion_ros2/vins_bag_reader
+BAG=rosbag2_2026_06_06-15_54_52_alwaysdrive
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereogps2.csv     gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereogps3.csv     gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereogps4.csv     gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereogps5.csv     gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimugps2.csv  gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimugps3.csv  gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimugps4.csv  gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimugps5.csv  gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimu2.csv
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimu3.csv
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimu4.csv
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimu5.csv
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereo2.csv
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereo3.csv
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereo4.csv
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereo5.csv
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereogps1.csv     gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimugps1.csv  gps /carla/ego_vehicle/gnss
+$BR src/config/carla/carla_stereo_imu.yaml $BAG ./output_direct/out_stereoimu1.csv
+$BR src/config/carla/carla_stereo.yaml     $BAG ./output_direct/out_stereo1.csv
+
+or
+
+# terminal A direct (VINS → RTAB-Map), via the wrapper that sets the OpenCV library path:
+rtab_tool/run_carla_rtab_direct.sh \
+  src/config/carla/carla_stereo_config.yaml \
+  rosbag2_2026_06_07-11_29_12_town01_drivenormal /tmp/rtab_carla.db
+
+ 
+########-- method 3 : carla c ++ --########
+# terminal A 
+/home/fibo3/carla-package/CarlaUE4.sh -RenderOffScreen -quality-level=Low
+
+# terminal B (drive : coverage)
+source install/setup.bash && ros2 launch vins_fusion_ros2 carla_native_multi.launch.py   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=coverage variants:=stereo_gps
+
+# terminal B (drive : trajectory (mpc)) stereo
+source install/setup.bash && ros2 launch vins_fusion_ros2 carla_native_multi.launch.py   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=trajectory   mpc_state:=/vins_stereo_vel/odometry bootstrap_secs:=8.0   target_speed:=5.5 horizon:=15 variants:=stereo
+
+# terminal B (drive : trajectory (mpc)) stereo + gps
+source install/setup.bash && ros2 launch vins_fusion_ros2 carla_native_multi.launch.py   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=trajectory   mpc_state:=/vins_stereo_gps_map/odometry bootstrap_secs:=8.0   target_speed:=5.5 horizon:=15 variants:=stereo_gps
+
+# terminal B (drive : trajectory (mpc)) -- rtab odom
+source install/setup.bash && ros2 launch vins_fusion_ros2 carla_native_multi.launch.py   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0   drive:=trajectory mpc_state:=/rtabmap/corrected_odom target_speed:=5.5 horizon:=15 variants:=stereo rtab_odom:=/vins_stereo/odometry
+
+
+# terminal C
+python3 plot_result_rtab_cpp.py
+
+# terminal D : gt   /corrected_odom
+python3 play_gt_path.py \
+  --npz gt/rtab_log_gt_town10.npz \
+  --state /carla/ego_vehicle/odometry \
+  --lookahead 20.0 
+  
+# terminal D : vins or rtab /carla/ego_vehicle/noise_odometry, /rtabmap
+python3 play_gt_path.py --npz gt/rtab_log_gt_town10.npz   --state /carla/ego_vehicle/noise_odometry --position-mode --lookahead 6.0
+
+# terminal E
+python3 mpc_debug_log.py --out run5
+
+# terminal F stereo
+python3 smooth_odom.py --in /vins_stereo/odometry --out /vins_stereo_vel/odometry --max-track-speed 1000
+
+# terminal F stereo+gps
+python3 smooth_odom.py --map-offset 100,10 --out /vins_stereo_gps_map/odometry
+
+# open 3D map
+source /opt/ros/humble/setup.bash
+rtabmap-databaseViewer ~/rtab_carla_live.db
+
