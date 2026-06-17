@@ -382,7 +382,7 @@ where $d_t$ = distance to the target point, $e_{\text{los},t} = \mathrm{atan2}(\
 (terminal-heading error). The $(1 + 0.08\,t)$ factor makes later steps count more (lookahead); the
 $3.0\,d_H^2$ term strongly pulls the final pose onto the target.
 
-**4. Control mapping → CARLA** (the winning $\delta^{*}, a^{*}$; $\mathrm{smooth}(\cdot)$ = ENU→CARLA
+**4. Control mapping → CARLA** (the winning $\delta^{\ast}, a^{\ast}$; $\mathrm{smooth}(\cdot)$ = ENU→CARLA
 sign flip, rate-limited $1.8/\text{s}$, $\alpha = 0.35$ low-pass). Here $v_c$ = cruise speed (config
 `target_speed`), $d$ = distance to the target and $d_{\text{tol}} = 0.75\,\text{m}$ = goal tolerance:
 
@@ -390,12 +390,12 @@ $$
 v_{\text{target}} = \min\!\left( v_c,\; \sqrt{2\,a_{\text{dec}}\,(d - d_{\text{tol}})} \right)
 $$
 
-When $a^{*} \ge 0$ the controller throttles, otherwise it brakes:
+When $a^{\ast} \ge 0$ the controller throttles, otherwise it brakes:
 
 $$
-\text{steer} = \mathrm{smooth}(-\delta^{*}), \qquad
-\text{throttle} = \mathrm{clamp}(\, 0.10 + 0.20\,a^{*} + 0.04\,(v_{\text{target}} - v),\ 0,\ 0.45 \,), \qquad
-\text{brake} = \mathrm{clamp}(\, -a^{*}/a_{\text{dec}},\ 0,\ 1 \,)
+\text{steer} = \mathrm{smooth}(-\delta^{\ast}), \qquad
+\text{throttle} = \mathrm{clamp}(\, 0.10 + 0.20\,a^{\ast} + 0.04\,(v_{\text{target}} - v),\ 0,\ 0.45 \,), \qquad
+\text{brake} = \mathrm{clamp}(\, -a^{\ast}/a_{\text{dec}},\ 0,\ 1 \,)
 $$
 
 The $v_{\text{target}}$ braking-distance cap makes the car slow smoothly into the goal; within `goal_tol` it
