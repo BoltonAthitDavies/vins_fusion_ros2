@@ -189,6 +189,10 @@ class Estimator {
 
   bool isFirstIMUReceived;
   bool failure_occur;
+  // Set when an abnormally large IMU interval (dropped messages) is seen while already
+  // tracking. Triggers a clean re-initialization before the next solve, instead of
+  // feeding a geometrically-inconsistent IMU factor into Ceres (which evaluates to NaN).
+  bool imu_gap_detected = false;
 
   //
   SafeClass<PointCloudData> safe_main_cloud;

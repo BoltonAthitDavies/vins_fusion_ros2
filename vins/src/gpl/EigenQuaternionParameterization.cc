@@ -24,8 +24,8 @@ bool EigenQuaternionParameterization::Plus(const double* x, const double* delta,
   return true;
 }
 
-bool EigenQuaternionParameterization::ComputeJacobian(const double* x,
-                                                      double* jacobian) const {
+bool EigenQuaternionParameterization::PlusJacobian(const double* x,
+                                                   double* jacobian) const {
   jacobian[0] = x[3];
   jacobian[1] = x[2];
   jacobian[2] = -x[1];  // NOLINT
@@ -39,6 +39,19 @@ bool EigenQuaternionParameterization::ComputeJacobian(const double* x,
   jacobian[10] = -x[1];
   jacobian[11] = -x[2];  // NOLINT
   return true;
+}
+
+bool EigenQuaternionParameterization::Minus(const double* /*y*/,
+                                            const double* /*x*/,
+                                            double* /*y_minus_x*/) const {
+  // Not required by the VINS solve; see header.
+  return false;
+}
+
+bool EigenQuaternionParameterization::MinusJacobian(const double* /*x*/,
+                                                    double* /*jacobian*/) const {
+  // Not required by the VINS solve; see header.
+  return false;
 }
 
 }  // namespace camodocal

@@ -1,0 +1,70 @@
+%YAML:1.0
+
+# LIVE native CARLA, STEREO-ONLY (imu:0). Tuning + extrinsics matched to the
+# VINS-Fusion-ROS2-winner (winner rig cam0 body y=+0.25 / cam1 y=-0.25).
+imu: 0
+num_of_cam: 2
+
+imu_topic: "/carla/ego_vehicle/imu"
+image0_topic: "/carla/ego_vehicle/cam_front_left/image"
+image1_topic: "/carla/ego_vehicle/cam_front_right/image"
+output_path: "output_rtab/"
+
+cam0_calib: "cam0_pinhole.yaml"
+cam1_calib: "cam1_pinhole.yaml"
+image_width: 960
+image_height: 720
+
+use_gpu: 0
+use_gpu_acc_flow: 0
+use_gpu_ceres: 0
+
+# Extrinsics — winner rig: cam0 (left) body y=+0.25, cam1 (right) body y=-0.25
+estimate_extrinsic: 0
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  1.5,
+          -1.0,  0.0,  0.0,  0.25,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  1.5,
+          -1.0,  0.0,  0.0, -0.25,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+# Feature tracker
+multiple_thread: 1
+image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
+max_cnt: 150
+min_dist: 30
+freq: 20
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+# Optimization (winner: heavier, offline-accuracy tuning)
+max_solver_time: 0.08
+max_num_iterations: 100
+keyframe_parallax: 5.0
+
+# IMU noise — Bosch BNO055 (unused with imu:0, kept for parity)
+acc_n: 0.00147
+gyr_n: 0.000244
+acc_w: 0.0005
+gyr_w: 0.00002
+g_norm: 9.81007
+
+estimate_td: 0
+td: 0.0
+
+load_previous_pose_graph: 0
+pose_graph_save_path: "output/pose_graph/"
+save_image: 1

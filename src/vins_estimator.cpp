@@ -1,6 +1,8 @@
 #include <cv_bridge/cv_bridge.h>
 #include <vins_fusion_ros2/vins_estimator.h>
 
+#include <fstream>
+
 VinsEstimator::VinsEstimator() : rclcpp::Node("vins_estimator") {
   options = std::make_shared<VINSOptions>();
   estimator_ = std::make_shared<Estimator>();
@@ -21,6 +23,19 @@ void VinsEstimator::initializeParamters() {
   body_frame_id = readParam<std::string>(this, "body_frame_id", "body");
   camera_frame_id = readParam<std::string>(this, "camera_frame_id", "camera");
   options->readParameters(config_file);
+
+  // Optional ROS param "output_path" overrides the config's output_path, so each
+  // node instance can write its own vio.csv without editing the yaml. The
+  // directory must already exist (we don't mkdir). Empty = keep the config value.
+  auto output_path = readParam<std::string>(this, "output_path", "");
+  if (!output_path.empty()) {
+    options->OUTPUT_FOLDER = output_path;
+    options->VINS_RESULT_PATH = output_path + "/vio.csv";
+    std::ofstream(options->VINS_RESULT_PATH, std::ios::out);  // truncate/create fresh
+    RCLCPP_INFO(this->get_logger(), "output_path override -> %s",
+                options->VINS_RESULT_PATH.c_str());
+  }
+
   estimator_->initialize(options);
 }
 void VinsEstimator::initializeSubscribers() {
@@ -41,8 +56,11 @@ void VinsEstimator::initializeSubscribers() {
   sub_opt_feature.callback_group = feature_callback_group_;
 
   if (options->hasImu()) {
+    // Deep IMU queue (~25s at 80Hz): during the init burst or any processing hiccup the
+    // estimator can briefly fall behind, and dropping IMU here would create a large gap
+    // between processed frames that corrupts pre-integration. Reliable by default.
     auto imu = this->create_subscription<sensor_msgs::msg::Imu>(
-        options->imuTopic(), rclcpp::QoS(rclcpp::KeepLast(100)),
+        options->imuTopic(), rclcpp::QoS(rclcpp::KeepLast(2000)),
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
           auto imu_msg = fromMsg(*msg);
           estimator_->inputIMU(imu_msg);
@@ -52,16 +70,24 @@ void VinsEstimator::initializeSubscribers() {
   }
 
   if (options->isUsingStereo()) {
+    // Reliable + deep image QoS instead of the best-effort sensor-data profile. The
+    // default best-effort/depth-5 profile silently drops stereo frames when the node
+    // falls behind real time (worst during initialization), which produces multi-second
+    // gaps between processed frames -> NaN in IMU pre-integration. Buffering them keeps
+    // the frame cadence intact. Bags here are published RELIABLE, so this matches.
+    rmw_qos_profile_t image_qos = rmw_qos_profile_sensor_data;
+    image_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+    image_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    image_qos.depth = 100;
+
     sub_img0_filter_ = std::make_shared<Subscriber<Image>>(
-        this, options->imageTopic(), rmw_qos_profile_sensor_data,
-        sub_opt_image);
+        this, options->imageTopic(), image_qos, sub_opt_image);
 
     sub_img1_filter_ = std::make_shared<Subscriber<Image>>(
-        this, options->image1Topic(), rmw_qos_profile_sensor_data,
-        sub_opt_image);
+        this, options->image1Topic(), image_qos, sub_opt_image);
 
     sync_img_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
-        SyncPolicy(10), *sub_img0_filter_, *sub_img1_filter_);
+        SyncPolicy(100), *sub_img0_filter_, *sub_img1_filter_);
 
     sync_img_->registerCallback(std::bind(&VinsEstimator::stereoCallback, this,
                                           std::placeholders::_1,

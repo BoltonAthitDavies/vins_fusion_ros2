@@ -1,0 +1,98 @@
+%YAML:1.0
+
+#common parameters
+#support: 1 imu 1 cam; 1 imu 2 cam: 2 cam;
+imu: 1
+num_of_cam: 2
+
+imu_topic: "/carla/ego_vehicle/imu"
+image0_topic: "/carla/ego_vehicle/cam_front_left/image"
+image1_topic: "/carla/ego_vehicle/cam_front_right/image"
+output_path: "output"
+
+cam0_calib: "cam_front_left.yaml"
+cam1_calib: "cam_front_right.yaml"
+image_width: 960
+image_height: 720
+
+# GPU acceleration
+use_gpu         : 0
+use_gpu_acc_flow: 0
+use_gpu_ceres   : 0
+
+
+# Extrinsic parameter between IMU and Camera.
+estimate_extrinsic: 0   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
+                        # 1  Have an initial guess about extrinsic parameters. We will optimize around your initial guess.
+
+# Derived from config/carla/objects.json spawn points (vehicle frame, all zero rotation):
+#   imu             (x,y,z) = (0.0,  0.0, 1.5)
+#   cam_front_left  (x,y,z) = (1.5,  0.25, 1.5)
+#   cam_front_right (x,y,z) = (1.5, -0.25, 1.5)
+# carla_ros_bridge maps CARLA (x-fwd, y-right, z-up) -> ROS REP-103 (x-fwd, y-left, z-up)
+# by negating y. The camera optical frame is REP-104 (x-right, y-down, z-fwd), giving the
+# fixed rotation body_R_cam = [[0,0,1],[-1,0,0],[0,-1,0]]. Translation is the camera origin
+# minus the IMU origin expressed in the ROS body (IMU) frame.
+# NOTE: if stereo geometry looks wrong, the most likely culprit is the sign of the y
+# translation below (the 0.5 m baseline). Cross-check against the bag's camera_info topics.
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0, 0, 1,  1.5,
+          -1, 0, 0, -0.25,
+           0,-1, 0,  0,
+           0, 0, 0,  1]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0, 0, 1,  1.5,
+          -1, 0, 0,  0.25,
+           0,-1, 0,  0,
+           0, 0, 0,  1]
+
+#Multiple thread support
+multiple_thread: 1
+
+#feature traker paprameters
+max_cnt: 150            # max feature number in feature tracking
+min_dist: 30            # min distance between two features
+freq: 10                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image
+F_threshold: 1.0        # ransac threshold (pixel)
+show_track: 1           # publish tracking image as topic
+flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
+
+#optimization parameters
+max_solver_time: 0.04  # max solver itration time (ms), to guarantee real time
+max_num_iterations: 8   # max solver itrations, to guarantee real time
+keyframe_parallax: 10.0 # keyframe selection threshold (pixel)
+
+#imu parameters       The more accurate parameters you provide, the better performance
+# Values below are CARLA's sim noise from objects.json (sensor.other.imu):
+#   noise_accel_stddev = 0.013147, noise_gyro_stddev = 0.002182, noise_gyro_bias = 0.0001
+# CARLA does not expose an accelerometer bias random walk, so acc_w uses a typical value.
+# These sim values are optimistic; if the estimator diverges, try inflating acc_n / gyr_n
+# by 5-10x (a common fix for VINS on CARLA, and the likely cause of past divergence).
+# --- current config (commented) : CARLA sim-noise values, for the noisy-IMU bags ---
+# acc_n: 0.013147     # accelerometer measurement noise standard deviation.
+# gyr_n: 0.002182     # gyroscope measurement noise standard deviation.
+# acc_w: 0.001        # accelerometer bias random work noise standard deviation.
+# gyr_w: 0.0001       # gyroscope bias random work noise standard deviation.
+# --- new config : for rosbag2_2026_06_06-17_15_44_noimunoise (IMU noise disabled in CARLA) ---
+# Sensor noise is ~0, so use small (but non-zero, for numerical stability) noise densities.
+acc_n: 0.001        # accelerometer measurement noise standard deviation.
+gyr_n: 0.0001       # gyroscope measurement noise standard deviation.
+acc_w: 0.0001       # accelerometer bias random work noise standard deviation.
+gyr_w: 0.00001      # gyroscope bias random work noise standard deviation.
+g_norm: 9.81        # gravity magnitude
+
+#unsynchronization parameters
+estimate_td: 1                      # online estimate time offset between camera and imu
+td: 0.0                             # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
+
+#loop closure parameters
+load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
+pose_graph_save_path: "output/pose_graph/" # save and load path
+save_image: 1                   # save image in pose graph for visualization prupose; you can close this function by setting 0

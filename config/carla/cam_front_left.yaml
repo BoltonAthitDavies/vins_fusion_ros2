@@ -1,0 +1,20 @@
+%YAML:1.0
+---
+# CARLA sensor.camera.rgb (cam_front_left)
+# Derived from config/carla/objects.json: image 960x720, fov 90 deg (horizontal).
+# Pinhole focal: fx = width / (2*tan(fov/2)) = 960 / 2 = 480; CARLA uses fy = fx.
+# Principal point = image center. CARLA renders an ideal pinhole -> no distortion.
+model_type: PINHOLE
+camera_name: cam_front_left
+image_width: 960
+image_height: 720
+distortion_parameters:
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+projection_parameters:
+   fx: 480.0
+   fy: 480.0
+   cx: 480.0
+   cy: 360.0

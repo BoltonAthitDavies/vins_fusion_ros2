@@ -1,7 +1,9 @@
+#include <opencv2/core.hpp>
 #include <vins_fusion_ros2/vins_estimator.h>
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
+  cv::theRNG().state = 42;  // seed RANSAC for deterministic feature geometry
   auto node = std::make_shared<VinsEstimator>();
   // 创建多线程执行器
   rclcpp::executors::MultiThreadedExecutor executor;

@@ -1,0 +1,84 @@
+# %YAML:1.0
+
+# # TUNED variant of carla_stereo_imu_config.yaml for the fast-vehicle CARLA bag.
+# # Differences vs baseline:
+# #   - image_skip: 1     -> process EVERY stereo frame (10 Hz) instead of every other (5 Hz).
+# #                          The car moves ~20 m/s, so 5 Hz = ~4 m between keyframes, too sparse.
+# #   - show_track: 0     -> stop publishing the annotated tracking image (less per-frame load).
+# #   - acc_n/gyr_n/...   -> IMU noise inflated ~6x over CARLA's optimistic sim values to stop
+# #                          the estimator from over-trusting the IMU and diverging.
+
+# #common parameters
+# imu: 1
+# num_of_cam: 2
+
+# imu_topic: "/carla/ego_vehicle/imu"
+# image0_topic: "/carla/ego_vehicle/cam_front_left/image"
+# image1_topic: "/carla/ego_vehicle/cam_front_right/image"
+# output_path: "output"
+
+# cam0_calib: "cam_front_left.yaml"
+# cam1_calib: "cam_front_right.yaml"
+# image_width: 960
+# image_height: 720
+
+# # process every incoming stereo frame (1) rather than every other (2)
+# image_skip: 1
+
+# # GPU acceleration (requires OpenCV built WITH_CUDA in ~/local + GPU_MODE compiled in)
+# use_gpu         : 1
+# use_gpu_acc_flow: 1
+# use_gpu_ceres   : 0
+
+# # Extrinsic parameter between IMU and Camera (identical to baseline).
+# estimate_extrinsic: 0
+# body_T_cam0: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 0, 0, 1,  1.5,
+#           -1, 0, 0, -0.25,
+#            0,-1, 0,  0,
+#            0, 0, 0,  1]
+
+# body_T_cam1: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 0, 0, 1,  1.5,
+#           -1, 0, 0,  0.25,
+#            0,-1, 0,  0,
+#            0, 0, 0,  1]
+
+# #Multiple thread support
+# multiple_thread: 1
+
+# #feature traker paprameters
+# max_cnt: 150
+# min_dist: 30
+# freq: 10
+# F_threshold: 1.0
+# show_track: 0           # tuned: don't publish the debug tracking image (saves per-frame work)
+# flow_back: 1
+
+# #optimization parameters
+# max_solver_time: 0.04
+# max_num_iterations: 8
+# keyframe_parallax: 10.0
+
+# #imu parameters -- INFLATED ~6x over CARLA sim values (objects.json) to prevent divergence.
+# # sim values were: acc_n=0.013147, gyr_n=0.002182, acc_w=0.001, gyr_w=0.0001
+# acc_n: 0.08         # accelerometer measurement noise standard deviation.
+# gyr_n: 0.012        # gyroscope measurement noise standard deviation.
+# acc_w: 0.004        # accelerometer bias random walk.
+# gyr_w: 0.0006       # gyroscope bias random walk.
+# g_norm: 9.81        # gravity magnitude
+
+# #unsynchronization parameters
+# estimate_td: 1
+# td: 0.0
+
+# #loop closure parameters
+# load_previous_pose_graph: 0
+# pose_graph_save_path: "output/pose_graph/"
+# save_image: 0

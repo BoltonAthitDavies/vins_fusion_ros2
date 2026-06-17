@@ -1,0 +1,16 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/fibo3/ros2_ws/install/cv_bridge/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages",
+        "/home/fibo3/carla_api_fix",
+        "/home/fibo3/carla_api_fix"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/fibo3/ros2_ws/install/cv_bridge/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages",
+        "/home/fibo3/carla_api_fix",
+        "/home/fibo3/carla_api_fix"
+    ]
+}

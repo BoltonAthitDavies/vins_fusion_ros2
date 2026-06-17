@@ -57,6 +57,11 @@ class IntegrationBase : public std::enable_shared_from_this<IntegrationBase> {
         Eigen::Matrix3d::Identity();
   }
 
+  // Upper bound (seconds) on a single IMU integration step. Nominal IMU dt is on the
+  // order of milliseconds; a dt this large only happens when messages are dropped, and
+  // integrating it would produce NaN. Shared by the estimator's clamps below.
+  static constexpr double MAX_IMU_DT = 0.5;
+
   ImuOptions getImuOptions() const { return imu_options; }
 
   void push_back(const IMUData &data) {
@@ -170,19 +175,23 @@ class IntegrationBase : public std::enable_shared_from_this<IntegrationBase> {
   }
 
   void propagate(const IMUData &data) {
-    if (data.timestamp > 1.0) {
-      VINS_ERROR << "Abnormal IMU timestamp jump detected: " << data.timestamp;
-      last_imu = data;
-      return;
-    }
     current_imu = data;
+    // Defensive clamp: integrating a multi-second interval (e.g. when IMU messages are
+    // dropped under load) blows the covariance/jacobian up to NaN and aborts the solver.
+    // Bound the dt so the pre-integration stays finite AND consistent with sum_dt below.
+    // Callers (processIMU) already clamp; this is a safety net for any direct caller.
+    if (current_imu.timestamp > MAX_IMU_DT) {
+      VINS_WARN << "Large IMU pre-integration interval " << current_imu.timestamp
+                << "s; clamping to " << MAX_IMU_DT;
+      current_imu.timestamp = MAX_IMU_DT;
+    }
     Vector3d result_delta_p;
     Quaterniond result_delta_q;
     Vector3d result_delta_v;
     Vector3d result_linearized_ba;
     Vector3d result_linearized_bg;
 
-    midPointIntegration(last_imu, data, delta_p, delta_q, delta_v,
+    midPointIntegration(last_imu, current_imu, delta_p, delta_q, delta_v,
                         linearized_ba, linearized_bg, result_delta_p,
                         result_delta_q, result_delta_v, result_linearized_ba,
                         result_linearized_bg, 1);
@@ -195,7 +204,7 @@ class IntegrationBase : public std::enable_shared_from_this<IntegrationBase> {
     linearized_ba = result_linearized_ba;
     linearized_bg = result_linearized_bg;
     delta_q.normalize();
-    sum_dt += data.timestamp;
+    sum_dt += current_imu.timestamp;
     last_imu = current_imu;
   }
 

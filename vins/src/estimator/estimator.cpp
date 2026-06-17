@@ -10,6 +10,8 @@
 
 #include <vins/estimator/estimator.h>
 
+#include <fstream>
+
 Estimator::Estimator() {}
 
 Estimator::~Estimator() {
@@ -33,7 +35,10 @@ void Estimator::resetState() {
     clearBuffer(featureBuffer);
   }
 
-  std::lock_guard<std::mutex> lock(processingMutex);
+  // NOTE: resetState() is only called from processNonLinearSolver's failure/gap-reset
+  // paths, which already hold processingMutex (taken in processMeasurements around
+  // processImage). Re-locking a std::mutex here would self-deadlock and hang the node on
+  // every reset -- which is exactly what happened. Rely on the caller's lock instead.
   previousTimestamp = -1;
   currentTimestamp = 0;
   openExEstimation = 0;
@@ -113,7 +118,7 @@ void Estimator::inputImage(const ImageData &image) {
     safe_track_image.set(track_image);
   }
 
-  if (inputImageCount % 2 == 0 || featureBuffer.empty()) {
+  if (inputImageCount % options->imageSkip() == 0 || featureBuffer.empty()) {
     {
       std::lock_guard<std::mutex> lock(featureBufferMutex);
       featureBuffer.push(make_pair(image.timestamp, featureFrame));
@@ -213,6 +218,7 @@ void Estimator::processMeasurements() {
         processIMU(imu_datas[i], dt);
       }
     }
+    TicToc t_proc;
     {
       std::lock_guard<std::mutex> lock(processingMutex);
       processImage(feature.second, feature.first);
@@ -220,6 +226,16 @@ void Estimator::processMeasurements() {
       collectPointCloudAll(feature.first);
       previousTimestamp = currentTimestamp;
     }
+    // Real-time profiling: per-frame wall-clock processing cost and the feature backlog.
+    // If proc_ms stays under the inter-keyframe period and backlog stays small, the node
+    // keeps up; a growing backlog means it cannot process this stream in real time.
+    size_t backlog;
+    {
+      std::lock_guard<std::mutex> fl(featureBufferMutex);
+      backlog = featureBuffer.size();
+    }
+    VINS_INFO << "PERF t=" << currentTimestamp << " proc_ms=" << t_proc.toc()
+              << " backlog=" << backlog << " recv=" << inputImageCount;
   }
 }
 void Estimator::updateCameraPose(int index) {
@@ -338,6 +354,22 @@ void Estimator::processIMU(const IMUData &data, double deltaTime) {
     previousImuData = data;
   }
 
+  // Guard against abnormally large IMU intervals (e.g. messages dropped while the node
+  // falls behind real time). Integrating a multi-second dt explodes BOTH the
+  // pre-integration covariance and the propagated state (updateStateWithIMU) into NaN,
+  // which aborts the Ceres solver. Clamping here keeps the pre-integration and the state
+  // update consistent and finite so the estimator recovers instead of crashing.
+  const double max_imu_dt = IntegrationBase::MAX_IMU_DT;
+  if (deltaTime > max_imu_dt) {
+    VINS_WARN << "Large IMU interval " << deltaTime
+              << "s (likely dropped messages); clamping to " << max_imu_dt;
+    deltaTime = max_imu_dt;
+    // If we are already tracking, a gap this large means the window's visual and inertial
+    // constraints are no longer mutually consistent. Flag a re-initialization rather than
+    // limp on with a clamped factor that would NaN the solver next frame.
+    if (solver_flag == SolverState::NON_LINEAR) imu_gap_detected = true;
+  }
+
   if (!pre_integrations[frameCount]) {
     pre_integrations[frameCount] = std::make_shared<IntegrationBase>(
         previousImuData, estimator_state[frameCount].accel_bias,
@@ -440,6 +472,16 @@ void Estimator::processInitialization(Timestamp timestamp) {
   }
 }
 void Estimator::processNonLinearSolver(Timestamp timestamp) {
+  // A large IMU gap (dropped messages) was detected while tracking: re-initialize cleanly
+  // instead of running the solver on an inconsistent window (which evaluates to NaN).
+  if (imu_gap_detected) {
+    VINS_WARN << "Re-initializing after IMU gap (dropped messages).";
+    imu_gap_detected = false;
+    failure_occur = 1;
+    resetState();
+    initializeCamerasFromOptions();
+    return;
+  }
   if (!options->hasImu()) {
     featureManager.initFramePoseByPnP(frameCount, estimator_state,
                                       cameraTranslation, cameraRotation);
@@ -481,6 +523,24 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
   vio_odom.orientation = Quaterniond(estimator_state[WINDOW_SIZE].rotation);
   vio_odom.velocity = estimator_state[WINDOW_SIZE].velocity;
   safe_vio_odom.set(vio_odom);
+
+  // Append the latest VIO state to the result CSV. This port only truncates the file at
+  // startup (parameters.h) and otherwise never wrote it, so vio.csv was always empty.
+  // Format matches VINS-Fusion: t_ns, px,py,pz, qw,qx,qy,qz, vx,vy,vz.
+  if (!options->VINS_RESULT_PATH.empty()) {
+    std::ofstream foutC(options->VINS_RESULT_PATH, std::ios::app);
+    if (foutC.is_open()) {
+      foutC.setf(std::ios::fixed, std::ios::floatfield);
+      foutC.precision(0);
+      foutC << timestamp * 1e9 << ",";
+      foutC.precision(5);
+      foutC << vio_odom.position.x() << "," << vio_odom.position.y() << ","
+            << vio_odom.position.z() << "," << vio_odom.orientation.w() << ","
+            << vio_odom.orientation.x() << "," << vio_odom.orientation.y() << ","
+            << vio_odom.orientation.z() << "," << vio_odom.velocity.x() << ","
+            << vio_odom.velocity.y() << "," << vio_odom.velocity.z() << std::endl;
+    }
+  }
 }
 
 void Estimator::processMonoWithImuInitialization(Timestamp timestamp) {
@@ -1459,9 +1519,16 @@ void Estimator::outliersRejection(set<int> &removeIndex) {
 void Estimator::fastPredictIMU(const IMUData &data) {
   std::lock_guard<std::mutex> lock(propagateMutex);
   double dt = data.timestamp - latestImuData.timestamp;
-  if (dt > 1.0) {
-    VINS_ERROR << "Abnormal IMU timestamp jump detected: " << dt;
-    return;
+  // Clamp (don't early-return): returning without updating latestImuData would leave it
+  // stale so every subsequent sample also sees a huge dt, permanently stalling the fast
+  // IMU odometry. A bounded dt keeps this propagation finite; latestImuData is updated
+  // below regardless so the stream stays in sync.
+  if (dt > IntegrationBase::MAX_IMU_DT) {
+    VINS_WARN << "Large IMU interval " << dt
+              << "s in fast propagation; clamping to " << IntegrationBase::MAX_IMU_DT;
+    dt = IntegrationBase::MAX_IMU_DT;
+  } else if (dt < 0.0) {
+    dt = 0.0;
   }
   Eigen::Vector3d un_acc_0 =
       latest_Q * (latestImuData.linear_acceleration - latest_state.accel_bias) -

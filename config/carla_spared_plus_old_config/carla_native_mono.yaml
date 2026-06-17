@@ -1,0 +1,102 @@
+%YAML:1.0
+
+#common parameters
+#support: 1 imu 1 cam; 1 imu 2 cam: 2 cam;
+imu: 1
+num_of_cam: 1
+
+imu_topic: "/carla/ego_vehicle/imu"
+image0_topic: "/carla/ego_vehicle/cam_front_left/image"
+image1_topic: "/carla/ego_vehicle/cam_front_right/image"
+output_path: "output"
+
+cam0_calib: "cam0_pinhole.yaml"
+cam1_calib: "cam1_pinhole.yaml"
+image_width: 960
+image_height: 720
+
+# GPU acceleration
+use_gpu         : 0
+use_gpu_acc_flow: 0
+use_gpu_ceres   : 0
+
+
+# Extrinsic parameter between IMU and Camera.
+estimate_extrinsic: 0   # 0 = trust the matrices below; 1 = optimize from this initial guess.
+
+# body_T_cam = [ R_body_cam  |  t_body_cam ]
+# CARLA REP-103 body: x-forward, y-left, z-up. Camera optical: x-right, y-down, z-forward.
+# Columns of R_body_cam = cam-frame basis vectors expressed in body frame:
+#   cam_x(right) -> body(0,-1,0); cam_y(down) -> body(0,0,-1); cam_z(forward) -> body(1,0,0).
+# Translation: cam spawn (1.5, +/-0.25, 1.5) minus imu spawn (0,0,1.5) = (1.5, +/-0.25, 0).
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  1.5,
+          -1.0,  0.0,  0.0, -0.25,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  1.5,
+          -1.0,  0.0,  0.0,  0.25,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+#Multiple thread support
+multiple_thread: 0
+
+#feature tracker parameters
+max_cnt: 150            # max feature number in feature tracking
+min_dist: 30            # min distance between two features
+freq: 10                # frequency (Hz) of publish tracking result. CARLA cam_front_* tick is 0.1s => 10 Hz.
+F_threshold: 1.0        # ransac threshold (pixel)
+show_track: 0
+flow_back: 1            # forward+backward optical flow to improve feature tracking
+
+#optimization parameters
+max_solver_time: 0.04
+max_num_iterations: 8
+keyframe_parallax: 10.0
+
+#imu parameters
+#
+# --- OLD: matched the near-noise-free IMU previously active in objects.json
+#          (noise_accel_stddev=0.00001, noise_gyro_stddev=0.00001, no bias)
+# acc_n: 0.0000012     # 1.12e-6 m/s²/√Hz
+# gyr_n: 0.0000012     # 1.12e-6 rad/s/√Hz
+# acc_w: 0.00000001    # 1e-8 m/s³/√Hz
+# gyr_w: 0.00000001    # 1e-8 rad/s²/√Hz
+#
+# --- NEW: matched to currently-active IMU in objects.json (line 65, no _ prefix)
+#     per-sample noise @ 80 Hz (sensor_tick=0.0125):
+#       noise_accel_stddev = 0.013147 m/s²
+#       noise_gyro_stddev  = 0.002182 rad/s
+#       noise_gyro_bias    = small constant (~1-2e-4 rad/s) — CARLA models bias as a
+#                            fixed offset (no random walk), but VINS estimates bias
+#                            online via random walk, so set acc_w/gyr_w to small
+#                            positive values to allow adaptation.
+#     Conversion: σ_continuous = σ_discrete / √f_s
+#       acc_n = 0.013147 / √80 ≈ 0.001470
+#       gyr_n = 0.002182 / √80 ≈ 0.000244
+acc_n: 0.00147       # 1.47e-3 m/s²/√Hz
+gyr_n: 0.000244      # 2.44e-4 rad/s/√Hz
+acc_w: 0.0001        # 1e-4 m/s³/√Hz (allow bias adaptation; CARLA has no true drift)
+gyr_w: 0.00001       # 1e-5 rad/s²/√Hz (allow bias adaptation)
+g_norm: 9.81
+
+#unsynchronization parameters
+estimate_td: 0
+td: 0.0
+
+#loop closure parameters
+load_previous_pose_graph: 0
+pose_graph_save_path: "output/pose_graph/"
+save_image: 0
+
+# Live native driver: process every frame (real-time ~10 Hz, within budget).
+image_skip: 1

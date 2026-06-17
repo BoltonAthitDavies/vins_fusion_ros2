@@ -15,10 +15,17 @@
 
 #include <Eigen/Dense>
 
-class PoseLocalParameterization : public ceres::LocalParameterization {
+class PoseLocalParameterization : public ceres::Manifold
+{
   virtual bool Plus(const double *x, const double *delta,
                     double *x_plus_delta) const;
-  virtual bool ComputeJacobian(const double *x, double *jacobian) const;
-  virtual int GlobalSize() const { return 7; };
-  virtual int LocalSize() const { return 6; };
+  virtual bool PlusJacobian(const double *x, double *jacobian) const;
+  // Minus / MinusJacobian are part of the Manifold interface but are not used
+  // by the VINS solve (only Plus / PlusJacobian are). They are provided so the
+  // class is concrete; they intentionally report failure if ever invoked.
+  virtual bool Minus(const double *y, const double *x,
+                     double *y_minus_x) const;
+  virtual bool MinusJacobian(const double *x, double *jacobian) const;
+  virtual int AmbientSize() const { return 7; };
+  virtual int TangentSize() const { return 6; };
 };

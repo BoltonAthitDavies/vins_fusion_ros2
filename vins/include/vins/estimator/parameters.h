@@ -76,6 +76,9 @@ struct VINSOptions {
   double ransac_reproj_threshold = 0.0;
   int show_track = 0;
   int enable_reverse_optical_flow_check = 0;
+  // Process 1 of every `image_skip` incoming (stereo) frames. 2 = legacy half-rate
+  // behavior; 1 = process every frame (higher visual rate, better for fast motion).
+  int image_skip = 2;
   ///////////////////////////////////////////////////////////////////////////
 
   // 读取参数函数
@@ -93,6 +96,8 @@ struct VINSOptions {
     this->ransac_reproj_threshold = (double)fsSettings["F_threshold"];
     this->show_track = (int)fsSettings["show_track"];
     this->enable_reverse_optical_flow_check = (int)fsSettings["flow_back"];
+    if (!fsSettings["image_skip"].empty() && (int)fsSettings["image_skip"] > 0)
+      this->image_skip = (int)fsSettings["image_skip"];  // else keep default (2)
 
     this->USE_GPU = (int)fsSettings["use_gpu"];
     this->USE_GPU_ACC_FLOW = (int)fsSettings["use_gpu_acc_flow"];
@@ -199,6 +204,7 @@ struct VINSOptions {
   /// @brief Check if the configuration is stereo with IMU
   bool isStereoWithImu() const { return isUsingStereo() && hasImu(); }
   bool shouldShowTrack() const { return show_track; }
+  int imageSkip() const { return image_skip > 0 ? image_skip : 2; }
   bool isExtrinsicEstimationApproximate() const {
     return extrinsic_estimation_mode == ExtrinsicEstimationMode::APPROXIMATE;
   }
