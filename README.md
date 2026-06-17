@@ -158,7 +158,7 @@ $$
 dropped-out keyframe), the IMU preintegration terms, and the visual reprojection terms:
 
 $$
-\min_{\mathcal{X}} \left\{ \left\lVert r_p - H_p\,\mathcal{X} \right\rVert^{2} + \sum_{k \in \mathcal{B}} \left\lVert r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \right\rVert_{P_{\mathcal{B}}}^{2} + \sum_{(l,j) \in \mathcal{C}} \left\lVert r_{\mathcal{C}}(\hat{z}_{l}^{c_j},\, \mathcal{X}) \right\rVert_{P_{\mathcal{C}}}^{2} \right\}
+\min_{\mathcal{X}} \left\{ \left\| r_p - H_p\,\mathcal{X} \right\|^{2} + \sum_{k \in \mathcal{B}} \left\| r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \right\|_{P_{\mathcal{B}}}^{2} + \sum_{(l,j) \in \mathcal{C}} \left\| r_{\mathcal{C}}(\hat{z}_{l}^{c_j},\, \mathcal{X}) \right\|_{P_{\mathcal{C}}}^{2} \right\}
 $$
 
 **IMU preintegration residual** $r_{\mathcal{B}}$ couples two keyframes through the preintegrated
@@ -374,9 +374,7 @@ with $a_{\text{acc}} = 2$, $a_{\text{dec}} = 4\ \text{m/s}^2$.
 rollout + a heavy terminal pull):
 
 $$
-J = 0.12\,\delta^2 + 1.2\,(\delta - \delta_{\text{prev}})^2 + 0.04\left(\frac{a}{a_{\text{acc}} + a_{\text{dec}}}\right)^2
-+ \sum_{t=1}^{H} \Big[ (1 + 0.08\,t)\,1.8\,d_t^2 + 1.2\,e_{\text{los},t}^2 + 0.25\,e_{\text{tgt},t}^2 + 0.45\,(v_t - v_{\text{target}})^2 \Big]
-+ 3.0\,d_H^2
+J = 0.12\,\delta^2 + 1.2\,(\delta - \delta_{\text{prev}})^2 + 0.04\left(\frac{a}{a_{\text{acc}} + a_{\text{dec}}}\right)^2 + \sum_{t=1}^{H} \left[ (1 + 0.08\,t)\,1.8\,d_t^2 + 1.2\,e_{\text{los},t}^2 + 0.25\,e_{\text{tgt},t}^2 + 0.45\,(v_t - v_{\text{target}})^2 \right] + 3.0\,d_H^2
 $$
 
 where $d_t$ = distance to the target point, $e_{\text{los},t} = \mathrm{atan2}(\Delta y, \Delta x) - \psi_t$
@@ -384,17 +382,18 @@ where $d_t$ = distance to the target point, $e_{\text{los},t} = \mathrm{atan2}(\
 (terminal-heading error). The $(1 + 0.08\,t)$ factor makes later steps count more (lookahead); the
 $3.0\,d_H^2$ term strongly pulls the final pose onto the target.
 
-**4. Control mapping → CARLA** (the winning $\delta^*, a^*$; $\mathrm{smooth}(\cdot)$ = ENU→CARLA sign
-flip, rate-limited $1.8/\text{s}$, $\alpha = 0.35$ low-pass):
+**4. Control mapping → CARLA** (the winning $\delta^{*}, a^{*}$; $\mathrm{smooth}(\cdot)$ = ENU→CARLA
+sign flip, rate-limited $1.8/\text{s}$, $\alpha = 0.35$ low-pass). Here $v_c$ = cruise speed (config
+`target_speed`), $d$ = distance to the target and $d_{\text{tol}} = 0.75\,\text{m}$ = goal tolerance:
 
 $$
-v_{\text{target}} = \min\!\Big( \text{target\_speed},\; \sqrt{2\,a_{\text{dec}}\,(\text{dist} - \text{goal\_tol})} \Big), \qquad \text{goal\_tol} = 0.75\,\text{m}
+v_{\text{target}} = \min\!\left( v_c,\; \sqrt{2\,a_{\text{dec}}\,(d - d_{\text{tol}})} \right)
 $$
 
 $$
-\text{steer} = \mathrm{smooth}(-\delta^*), \qquad
-\text{throttle} = \mathrm{clamp}\big( 0.10 + 0.20\,a^* + 0.04\,(v_{\text{target}} - v),\; 0,\; 0.45 \big)\ \ (a^* \ge 0), \qquad
-\text{brake} = \mathrm{clamp}\!\left( \frac{-a^*}{a_{\text{dec}}},\; 0,\; 1 \right)\ \ (a^* < 0)
+\text{steer} = \mathrm{smooth}(-\delta^{*}), \qquad
+\text{throttle} = \mathrm{clamp}\!\left( 0.10 + 0.20\,a^{*} + 0.04\,(v_{\text{target}} - v),\; 0,\; 0.45 \right)\ \ (a^{*} \ge 0), \qquad
+\text{brake} = \mathrm{clamp}\!\left( \frac{-a^{*}}{a_{\text{dec}}},\; 0,\; 1 \right)\ \ (a^{*} < 0)
 $$
 
 The $v_{\text{target}}$ braking-distance cap makes the car slow smoothly into the goal; within `goal_tol` it
