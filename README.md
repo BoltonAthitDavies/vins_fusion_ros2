@@ -104,33 +104,36 @@ Cameras are mounted at x = 1.5 m, z = 1.5 m; left at y = −0.25 m, right at y =
 ### Frame convention (CARLA → ROS/ENU)
 
 CARLA is **left-handed (+y = right, yaw clockwise)**; ROS/ENU is right-handed (+y = left, yaw CCW).
-The bridge (`carla_world.cpp`, `getEgoState`/`getEgoOdom`) converts by **negating y, yaw, vy, and ωz**:
+The bridge (`carla_world.cpp`, `getEgoState`/`getEgoOdom`) converts by **negating $y$, yaw, $v_y$ and
+$\omega_z$**:
 
-```
-x_ros =  x_carla
-y_ros = -y_carla
-yaw_ros = -yaw_carla        vy_ros = -vy_carla      ωz_ros = -ωz_carla
-```
+$$
+x_{\text{ros}} = x_{\text{carla}}, \qquad
+y_{\text{ros}} = -y_{\text{carla}}, \qquad
+\psi_{\text{ros}} = -\psi_{\text{carla}}, \qquad
+v_{y,\text{ros}} = -v_{y,\text{carla}}, \qquad
+\omega_{z,\text{ros}} = -\omega_{z,\text{carla}}
+$$
 
 > A left/right **camera swap** (a consequence of this +y = right convention) was the root cause of
 > early live divergence; fixing it is what made live VINS match the offline result (see §4).
 
 ### Kinematic model & control
 
-The MPC rolls out a **kinematic bicycle model** (wheelbase **L = 2.875 m**, dt = 0.10 s):
+The MPC rolls out a **kinematic bicycle model** (wheelbase $L = 2.875\,\text{m}$, $dt = 0.10\,\text{s}$):
 
-```
-x   += v · cos(ψ) · dt
-y   += v · sin(ψ) · dt
-ψ   += (v / L) · tan(δ) · dt
-v   += a · dt
-```
+$$
+\dot{x} = v\cos\psi, \qquad
+\dot{y} = v\sin\psi, \qquad
+\dot{\psi} = \frac{v}{L}\tan\delta, \qquad
+\dot{v} = a
+$$
 
-- **State:** `{x, y, yaw, speed}` (ROS/ENU frame).
-- **Input:** `{steer δ, accel a}`, mapped to a CARLA `VehicleControl`:
-  `throttle ≈ 0.10 + 0.20·a + 0.04·(speed error)` (clamped to ≤ 0.45), `brake = −a / max_decel`,
-  `steer = −δ` (sign flip back into the CARLA frame). Max speed 8 m/s, max accel 2 m/s², max decel
-  4 m/s².
+- **State:** $(x, y, \psi, v)$ — position, heading, speed (ROS/ENU frame).
+- **Input:** $(\delta,\, a)$ — steering and acceleration, mapped to a CARLA `VehicleControl`:
+  $\text{throttle} \approx 0.10 + 0.20\,a + 0.04\,(\text{speed error})$ (clamped to $\le 0.45$),
+  $\text{brake} = -a / a_{\text{dec}}$, $\text{steer} = -\delta$ (sign flip back into the CARLA frame).
+  Max speed 8 m/s, max accel 2 m/s², max decel 4 m/s².
 
 ---
 
@@ -141,52 +144,58 @@ v   += a · dt
 VINS-Fusion is a **tightly-coupled, optimization-based** estimator: pose estimation = minimizing a
 sum of Mahalanobis residuals over a sliding window of recent keyframes (it is **not** a filter).
 
-**State** — sliding window of `n+1` keyframes and `m` features:
+**State** — sliding window of $n{+}1$ keyframes and $m$ features. Each keyframe state $x_k$ holds
+position, velocity, orientation, accelerometer bias and gyro bias; $x_c$ is the camera↔IMU extrinsic;
+$\lambda_l$ is the inverse depth of feature $l$:
 
-```
-X   = [ x_0, x_1, …, x_n,  x_c,  λ_0, …, λ_m ]
-x_k = [ p^w_{b_k},  v^w_{b_k},  q^w_{b_k},  b_a,  b_g ]   # pos, vel, orientation, accel-bias, gyro-bias
-x_c = [ p^b_c, q^b_c ]                                    # camera↔IMU extrinsic
-λ_l = inverse depth of feature l
-```
+$$
+\mathcal{X} = [\,x_0,\, x_1,\, \dots,\, x_n,\; x_c,\; \lambda_0,\, \dots,\, \lambda_m\,], \qquad
+x_k = [\,p^w_{b_k},\; v^w_{b_k},\; q^w_{b_k},\; b_a,\; b_g\,], \qquad
+x_c = [\,p^b_c,\; q^b_c\,]
+$$
 
-**Cost** — maximum-a-posteriori over three residual groups (prior + IMU + vision):
+**Cost** — maximum-a-posteriori over three residual groups: a marginalization prior (from the
+dropped-out keyframe), the IMU preintegration terms, and the visual reprojection terms:
 
-```
-min_X  {  ‖ r_p − H_p·X ‖²                                 # marginalization prior (drop-out keyframe)
-        + Σ_{k∈B}     ‖ r_B( ẑ_{b_k b_{k+1}}, X ) ‖²_{P_B}   # IMU preintegration
-        + Σ_{(l,j)∈C} ‖ r_C( ẑ^{c_j}_l,      X ) ‖²_{P_C} }  # visual reprojection
-```
+$$
+\min_{\mathcal{X}} \left\{\; \lVert r_p - H_p\,\mathcal{X} \rVert^2
+\;+\; \sum_{k \in \mathcal{B}} \big\lVert r_{\mathcal{B}}(\hat{z}_{b_k b_{k+1}},\, \mathcal{X}) \big\rVert^2_{P_{\mathcal{B}}}
+\;+\; \sum_{(l,j) \in \mathcal{C}} \big\lVert r_{\mathcal{C}}(\hat{z}^{\,c_j}_l,\, \mathcal{X}) \big\rVert^2_{P_{\mathcal{C}}} \;\right\}
+$$
 
-**IMU preintegration residual** `r_B` (couples two keyframes via preintegrated α̂, β̂, γ̂; `g^w` =
-gravity). This is the block that fails on CARLA — see §4.5:
+**IMU preintegration residual** $r_{\mathcal{B}}$ couples two keyframes through the preintegrated
+$\hat{\alpha},\hat{\beta},\hat{\gamma}$ ($g^w$ = gravity). This is the block that fails on CARLA
+(see §4.5):
 
-```
-r_B = [ R^{b_k}_w ( p^w_{b_{k+1}} − p^w_{b_k} − v^w_{b_k}·Δt + ½·g^w·Δt² )  − α̂
-        R^{b_k}_w ( v^w_{b_{k+1}} − v^w_{b_k} + g^w·Δt )                    − β̂
-        2·[ (γ̂)^{-1} ⊗ (q^w_{b_k})^{-1} ⊗ q^w_{b_{k+1}} ]_xyz
-        b_a,{k+1} − b_a,k
-        b_g,{k+1} − b_g,k ]
-```
+$$
+r_{\mathcal{B}} =
+\begin{bmatrix}
+R^{b_k}_w\big(p^w_{b_{k+1}} - p^w_{b_k} - v^w_{b_k}\Delta t + \tfrac{1}{2}g^w \Delta t^2\big) - \hat{\alpha} \\[2pt]
+R^{b_k}_w\big(v^w_{b_{k+1}} - v^w_{b_k} + g^w \Delta t\big) - \hat{\beta} \\[2pt]
+2\,\big[\, \hat{\gamma}^{-1} \otimes (q^w_{b_k})^{-1} \otimes q^w_{b_{k+1}} \,\big]_{xyz} \\[2pt]
+b_{a,k+1} - b_{a,k} \\[2pt]
+b_{g,k+1} - b_{g,k}
+\end{bmatrix}
+$$
 
-**Visual reprojection residual** `r_C` (feature `l` first seen in frame `i`, re-observed in frame `j`):
-back-project with its inverse depth `λ_l`, transport `i→j` through the poses, compare to the measured
-pixel `u^{c_j}_l`:
+**Visual reprojection residual** $r_{\mathcal{C}}$ — feature $l$ first seen in frame $i$, re-observed
+in frame $j$: back-project with its inverse depth $\lambda_l$, transport $i \to j$ through the poses,
+and compare to the measured pixel $u^{c_j}_l$ ($\pi(\cdot)$ = projection):
 
-```
-r_C = u^{c_j}_l  −  π( T^c_b · T^{b_j}_w · T^w_{b_i} · T^b_c · (1/λ_l)·u^{c_i}_l )
-```
+$$
+r_{\mathcal{C}} = u^{c_j}_l \;-\; \pi\!\left( T^c_b\, T^{b_j}_w\, T^w_{b_i}\, T^b_c\; \tfrac{1}{\lambda_l}\,u^{c_i}_l \right)
+$$
 
 **GPS fusion (`global_fusion`)** is a *second*, looser stage: a pose graph (Ceres,
 [`global_fusion/src/Factors.h`](../global_fusion/src/Factors.h)) that fuses the VIO trajectory with
-global GPS fixes. Two factor types:
+global GPS fixes. It has two factor types — a 3-D absolute GPS-position factor (`TError`) and a 6-D
+VIO relative-pose factor (`RelativeRTError`):
 
-```
-GPS position  (TError):       r_T = ( t_j − t_gps ) / σ_gps                          # 3-dim, absolute
-VIO relative  (RelativeRTError):
-   r_t = [ R(q_i)^{-1}·( t_j − t_i ) − t̂_ij ] / σ_t                                  # 3-dim
-   r_q = 2·[ q̂_ij^{-1} ⊗ ( q_i^{-1} ⊗ q_j ) ]_xyz / σ_q                              # 3-dim
-```
+$$
+r_T = \frac{t_j - t_{\text{gps}}}{\sigma_{\text{gps}}}, \qquad
+r_t = \frac{R(q_i)^{-1}\,(t_j - t_i) - \hat{t}_{ij}}{\sigma_t}, \qquad
+r_q = \frac{2\,\big[\, \hat{q}_{ij}^{-1} \otimes (q_i^{-1} \otimes q_j) \,\big]_{xyz}}{\sigma_q}
+$$
 
 The GPS factor anchors **absolute** position (kills long-term drift); the relative factor preserves
 the locally-smooth VIO **shape**. This is exactly why the GPS variants stay bounded where pure VO/VIO
@@ -337,49 +346,60 @@ A **sampling (brute-force) MPC**. Each control cycle it rolls a kinematic bicycl
 the horizon for a small grid of candidate `(steer, accel)` pairs, scores each rollout, and applies the
 lowest-cost one. No gradient solver — just enumerate, simulate, pick the best.
 
-**1. Bicycle-model rollout** — per candidate, `H` steps, `dt = 0.10 s`, wheelbase `L = 2.875 m`,
-`δ_max = 0.60 rad`. State is `(x, y, ψ, v)` in ROS/ENU:
+**1. Bicycle-model rollout** — per candidate, $H$ steps, $dt = 0.10\,\text{s}$, wheelbase
+$L = 2.875\,\text{m}$, $\delta_{\max} = 0.60\,\text{rad}$. State is $(x, y, \psi, v)$ in ROS/ENU:
 
-```
-v_{t+1} = clamp( v_t + a·dt,  0,  v_max=8 )
-x_{t+1} = x_t + v_{t+1}·cos(ψ_t)·dt
-y_{t+1} = y_t + v_{t+1}·sin(ψ_t)·dt
-ψ_{t+1} = ψ_t + (v_{t+1}/L)·tan(δ·δ_max)·dt
-```
+$$
+v_{t+1} = \mathrm{clamp}(v_t + a\,dt,\; 0,\; v_{\max}), \qquad
+x_{t+1} = x_t + v_{t+1}\cos\psi_t\,dt, \qquad
+y_{t+1} = y_t + v_{t+1}\sin\psi_t\,dt
+$$
+
+$$
+\psi_{t+1} = \psi_t + \frac{v_{t+1}}{L}\,\tan(\delta\,\delta_{\max})\,dt
+$$
 
 **2. Candidate set** — 7 steer × 6 accel = **42 rollouts** per cycle:
 
-```
-δ ∈ δ_prev + {−0.30, −0.18, −0.09, 0, +0.09, +0.18, +0.30}     (clamped |δ| ≤ 0.65)
-a ∈ { −a_dec, −½a_dec, a_desired, 0, +½a_acc, +a_acc }          (a_acc = 2, a_dec = 4 m/s²)
-   a_desired = clamp( (v_target − v) / (H·dt),  −a_dec,  a_acc )
-```
+$$
+\delta \in \delta_{\text{prev}} + \{-0.30,\, -0.18,\, -0.09,\, 0,\, 0.09,\, 0.18,\, 0.30\} \quad (|\delta| \le 0.65)
+$$
 
-**3. Cost** (minimized over the 42 candidates):
+$$
+a \in \{\, -a_{\text{dec}},\; -\tfrac{1}{2}a_{\text{dec}},\; a_{\text{des}},\; 0,\; \tfrac{1}{2}a_{\text{acc}},\; a_{\text{acc}} \,\}, \qquad
+a_{\text{des}} = \mathrm{clamp}\!\left( \frac{v_{\text{target}} - v}{H\,dt},\; -a_{\text{dec}},\; a_{\text{acc}} \right)
+$$
 
-```
-J =  0.12·δ²  +  1.2·(δ − δ_prev)²  +  0.04·( a / (a_acc + a_dec) )²        ← input regularizers
-   + Σ_{t=1..H} [ (1 + 0.08·t)·1.8·d_t²                                      ← lookahead-weighted position
-                  + 1.2·e_los,t²                                            ← align heading to line-of-sight
-                  + 0.25·e_tgt,t²                                           ← match terminal heading θ_target
-                  + 0.45·(v_t − v_target)² ]                                ← speed tracking
-   + 3.0·d_H²                                                               ← heavy terminal pull
-```
+with $a_{\text{acc}} = 2$, $a_{\text{dec}} = 4\ \text{m/s}^2$.
 
-where `d_t` = distance to the target point, `e_los,t = atan2(Δy,Δx) − ψ_t` (line-of-sight heading
-error), `e_tgt,t = θ_target − ψ_t` (terminal-heading error). The `(1 + 0.08·t)` factor makes later
-steps count more (lookahead); the `3.0·d_H²` term strongly pulls the final pose onto the target.
+**3. Cost** — minimized over the 42 candidates (input regularizers + a lookahead-weighted sum over the
+rollout + a heavy terminal pull):
 
-**4. Control mapping → CARLA** (the winning `δ*, a*`):
+$$
+J = 0.12\,\delta^2 + 1.2\,(\delta - \delta_{\text{prev}})^2 + 0.04\left(\frac{a}{a_{\text{acc}} + a_{\text{dec}}}\right)^2
++ \sum_{t=1}^{H} \Big[ (1 + 0.08\,t)\,1.8\,d_t^2 + 1.2\,e_{\text{los},t}^2 + 0.25\,e_{\text{tgt},t}^2 + 0.45\,(v_t - v_{\text{target}})^2 \Big]
++ 3.0\,d_H^2
+$$
 
-```
-v_target = min( target_speed,  √( 2·a_dec·(dist − goal_tol) ) )            goal_tol = 0.75 m
-steer    = smooth( −δ* )         # ENU→CARLA sign flip, rate-limited 1.8/s, α=0.35 low-pass
-throttle = clamp( 0.10 + 0.20·a* + 0.04·(v_target − v),  0,  0.45 )        if a* ≥ 0
-brake    = clamp( −a* / a_dec,  0,  1 )                                    if a* < 0
-```
+where $d_t$ = distance to the target point, $e_{\text{los},t} = \mathrm{atan2}(\Delta y, \Delta x) - \psi_t$
+(line-of-sight heading error) and $e_{\text{tgt},t} = \theta_{\text{target}} - \psi_t$
+(terminal-heading error). The $(1 + 0.08\,t)$ factor makes later steps count more (lookahead); the
+$3.0\,d_H^2$ term strongly pulls the final pose onto the target.
 
-The `v_target` braking-distance cap makes the car slow smoothly into the goal; within `goal_tol` it
+**4. Control mapping → CARLA** (the winning $\delta^*, a^*$; $\mathrm{smooth}(\cdot)$ = ENU→CARLA sign
+flip, rate-limited $1.8/\text{s}$, $\alpha = 0.35$ low-pass):
+
+$$
+v_{\text{target}} = \min\!\Big( \text{target\_speed},\; \sqrt{2\,a_{\text{dec}}\,(\text{dist} - \text{goal\_tol})} \Big), \qquad \text{goal\_tol} = 0.75\,\text{m}
+$$
+
+$$
+\text{steer} = \mathrm{smooth}(-\delta^*), \qquad
+\text{throttle} = \mathrm{clamp}\big( 0.10 + 0.20\,a^* + 0.04\,(v_{\text{target}} - v),\; 0,\; 0.45 \big)\ \ (a^* \ge 0), \qquad
+\text{brake} = \mathrm{clamp}\!\left( \frac{-a^*}{a_{\text{dec}}},\; 0,\; 1 \right)\ \ (a^* < 0)
+$$
+
+The $v_{\text{target}}$ braking-distance cap makes the car slow smoothly into the goal; within `goal_tol` it
 brakes to a stop. Defaults: `target_speed` 3.5 m/s (raise to ~5.5 to match autopilot-recorded GT),
 horizon 100 steps = 10 s (tune `horizon ≈ lookahead / target_speed` so the rollout reaches the target
 without overshooting).
