@@ -239,44 +239,91 @@ The GPS factor anchors **absolute** position (kills long-term drift); the relati
 the locally-smooth VIO **shape**. This is exactly why the GPS variants stay bounded where pure VO/VIO
 drift away.
 
-### 4.2 Configuration — reading the CARLA environment into the config
+### 4.2 Configuration — the four config layers
 
-Every non-default value in our config is justified by a *property of the CARLA sensor rig*, not
-guesswork. The files are [`carla_stereo.yaml`](config/carla/carla_stereo.yaml) and
-[`carla_stereo_imu.yaml`](config/carla/carla_stereo_imu.yaml); below is what we changed from the stock
-VINS-Fusion (EuRoC) template and **why CARLA makes that the right choice**.
+The SLAM stack is configured in **four layers**, one per pipeline stage. Each adds to the one before:
+
+| Layer | What it configures | Where | Used by variants |
+|-------|--------------------|-------|------------------|
+| **(a) VO** | stereo visual odometry (intrinsics, extrinsics, solver) | [`carla_stereo.yaml`](config/carla/carla_stereo.yaml) | `stereo`, `stereo+gps` |
+| **(b) VINS** | VO **+ IMU** (visual-inertial) | [`carla_stereo_imu.yaml`](config/carla/carla_stereo_imu.yaml) | `stereo+imu`, `stereo+imu+gps` |
+| **(c) global_fusion** | GPS pose-graph stage on top of VO/VINS | ROS args + `Factors.h` (sibling pkg) | `*+gps` |
+| **(d) RTAB** | live 3D mapping + loop closure | launch args in [`carla_native_multi.launch.py`](launch/carla_native_multi.launch.py) | live only |
+
+Every non-default value is justified by a *property of the CARLA rig*, not guesswork.
+
+**(a) VO config** ([`carla_stereo.yaml`](config/carla/carla_stereo.yaml), `imu: 0`) — the base layer.
+Below is what changed from the stock VINS-Fusion (EuRoC) template and **why CARLA makes it correct**:
 
 | Parameter | Stock (EuRoC) | Ours (CARLA) | Reason — what we know about the CARLA rig |
 |-----------|---------------|--------------|-------------------------------------------|
-| camera model | MEI/fisheye, nonzero $k_1,k_2,p_1,p_2$ | `PINHOLE`, distortion all 0 | CARLA's `sensor.camera.rgb` renders an **ideal pinhole** — there is physically no lens distortion to model |
-| $f_x,f_y,c_x,c_y$ | from calibration | $f{=}480$, $(c_x,c_y){=}(480,360)$ | intrinsics are **exact**, not measured: $f = W/2\tan(\text{FOV}/2) = 960/2\tan 45° = 480$; principal point = image center |
-| `body_T_cam0/1` | measured drone extrinsics | exact rig (fwd 1.5, $y{=}\pm0.25$, baseline 0.5 m) | we *place* the cameras in the sim, so the extrinsic is **known to machine precision** — no tape-measure error |
-| `estimate_extrinsic` | 0 | 0 | extrinsics are exact, so there is nothing to refine — let VINS trust them and spend its DOF elsewhere |
-| `estimate_td` / `td` | 0 / 0 | 0 / 0 | **synchronous** sim: camera and IMU are stamped off the *same* tick, so the cam–IMU time offset is exactly 0 |
-| `acc_n,gyr_n` | 0.1 / 0.01 | 0.00147 / 0.000244 | the sim IMU is **noise-free**; we use tiny BNO055-datasheet floors instead of EuRoC's real-MEMS noise |
-| `acc_w,gyr_w` | 0.001 / 0.0001 | 0.0005 / 0.00002 | same reasoning — minimal bias random-walk for a clean sim IMU |
-| `max_num_iterations` | 8 | 100 | EuRoC's 8 is a **real-time** cap; most of our evaluation is **offline** (`vins_bag_reader`), so we let Ceres fully converge for the accuracy ceiling |
+| camera model | MEI/fisheye, nonzero $k_1,k_2,p_1,p_2$ | `PINHOLE`, distortion all 0 | CARLA's `sensor.camera.rgb` renders an **ideal pinhole** — no lens distortion to model |
+| $f_x,f_y,c_x,c_y$ | from calibration | $f{=}480$, $(c_x,c_y){=}(480,360)$ | intrinsics are **exact**: $f = W/2\tan(\text{FOV}/2) = 960/2\tan 45° = 480$; principal point = image center |
+| `body_T_cam0/1` | measured drone extrinsics | exact rig (fwd 1.5, $y{=}\pm0.25$, baseline 0.5 m) | we *place* the cameras, so the extrinsic is **known to machine precision** — no tape-measure error |
+| `estimate_extrinsic` | 0 | 0 | extrinsics are exact, so nothing to refine — VINS trusts them and spends its DOF elsewhere |
+| `max_num_iterations` | 8 | 100 | EuRoC's 8 is a **real-time** cap; most evaluation is **offline** (`vins_bag_reader`), so let Ceres fully converge for the accuracy ceiling |
 | `max_solver_time` | 0.04 | 0.08 | headroom for the heavier solve (still keeps up live) |
-| `keyframe_parallax` | 10.0 | 5.0 | CARLA streets are wide and feature-sparse; a lower parallax threshold keeps **more keyframes** so the window isn't starved |
-| `image_skip` | (default 2) | 1 | process **every** frame — the default skip-2 created a frame-skip race that broke run-to-run determinism |
+| `keyframe_parallax` | 10.0 | 5.0 | CARLA streets are wide and feature-sparse; lower parallax keeps **more keyframes** so the window isn't starved |
+| `image_skip` | (default 2) | 1 | process **every** frame — skip-2 created a frame-skip race that broke run-to-run determinism |
 
-**The two choices that encode the most CARLA understanding:**
+> Calibration is the hardest, noisiest part of a real VINS setup; in CARLA the geometry is *given*, so
+> we hand VINS the exact model and `estimate_*: 0` tells it **not** to waste DOF re-estimating it.
+> (Mounting detail: cam0 = left at $y{=}{+}0.25$, cam1 = right at $y{=}{-}0.25$; flipping this L/R
+> assignment is the [camera-swap bug](#frame-convention-carla--rosenu) that broke live VINS.)
 
-- **Zero distortion + exact intrinsics/extrinsics + `estimate_*: 0`.** On a real rig, calibration is
-  the hardest and noisiest part of VINS setup. In CARLA the geometry is *given* — we render the
-  cameras — so we hand VINS the exact model and tell it **not** to waste degrees of freedom
-  re-estimating calibration. (Mounting detail: cam0 = left at body $y=+0.25$, cam1 = right at
-  $y=-0.25$; getting this L/R assignment wrong is exactly the
-  [camera-swap bug](#frame-convention-carla--rosenu) that broke live VINS.)
-- **`estimate_td: 0`.** Real sensors need online temporal calibration because camera and IMU run on
-  independent clocks. CARLA's synchronous mode emits every sensor from the **same** sim tick, so
-  $td \equiv 0$ — estimating it would only inject noise.
+**(b) VINS config** ([`carla_stereo_imu.yaml`](config/carla/carla_stereo_imu.yaml), `imu: 1`) — VO
+**plus the IMU**. Calibration, solver, and feature-tracker blocks are *identical* to the VO config;
+only the IMU is added:
 
-**One honest caveat.** The tight IMU noise values are the physically-correct description of a
-noise-free sim IMU, but they do **not** rescue stereo+IMU on smooth driving — that failure is an
-*observability* degeneracy (§4.6), not a noise-model error, and no `acc_n`/`gyr_n` setting fixes it.
-We keep the datasheet values because they honestly describe the sensor, not because they change the
-divergence.
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| `imu` | `0` → `1` | the one switch that turns VO into visual-**inertial** odometry |
+| `imu_topic` | `/carla/ego_vehicle/imu` | the sim IMU stream (200 Hz) |
+| `acc_n,gyr_n` | 0.00147 / 0.000244 | sim IMU is **noise-free**; tiny BNO055-datasheet floors instead of EuRoC's real-MEMS noise |
+| `acc_w,gyr_w` | 0.0005 / 0.00002 | minimal bias random-walk for a clean sim IMU |
+| `g_norm` | 9.81007 | CARLA's gravity magnitude |
+| `estimate_td` / `td` | 0 / 0 | **synchronous** sim: camera & IMU are stamped off the *same* tick, so the cam–IMU offset is exactly 0 — estimating it would only inject noise |
+
+> **Honest caveat.** These tight IMU values correctly describe a noise-free sim IMU, but they do **not**
+> rescue stereo+IMU on smooth driving — that is an *observability* degeneracy (§4.6), not a noise-model
+> error, and no `acc_n`/`gyr_n` setting fixes it. (The VO config also carries these values, unused, for
+> file parity.)
+
+**(c) global_fusion config** — the GPS pose-graph stage is a **separate package** (`global_fusion`)
+with **no YAML in this repo**. It is configured entirely by ROS arguments at launch — the VIO input,
+the GPS topic, and the fused output (see §[Commands](#9-commands)):
+
+```bash
+ros2 run global_fusion global_fusion_node --ros-args -p use_sim_time:=true \
+  -r /vins_estimator/odometry:=/vins_stereo/odometry \   # which VO/VINS variant to anchor
+  -r /gps:=/carla/ego_vehicle/gnss \                      # CARLA GNSS (noise-free)
+  -r global_odometry:=/vins_stereo_gps/odometry
+```
+
+The fusion **weights** (the $\sigma_{\text{gps}}, \sigma_t, \sigma_q$ of §4.1) are not exposed as
+parameters — they are the factor covariances hardcoded in `global_fusion/src/Factors.h`. Because
+CARLA's GNSS is noise-free, the GPS factor is trusted heavily, which is why the `*+gps` variants stay
+sub-metre and bounded.
+
+**(d) RTAB config** — live 3D mapping (apt `rtabmap_ros`) is configured by the `rtab_params` list and
+launch arguments in [`carla_native_multi.launch.py`](launch/carla_native_multi.launch.py), and runs
+under a **clean `LD_LIBRARY_PATH`** (`RTAB_CLEAN_LD`) to avoid an ABI clash with the `~/local` CUDA
+OpenCV. Key settings:
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `frame_id` / `odom_frame_id` | `body` / `world` | match the VINS odom tree (world→body), bridged onto `/tf` by `odom_to_tf.py` |
+| `visual_odometry` | `false` | RTAB does **not** compute its own odom — it consumes the VINS odom (`rtab_odom`) |
+| `stereo` | `true` | fed the live stereo pair + `camera_info` |
+| `Rtabmap/LoopGPS` | `true` | use GNSS to assist loop-closure detection |
+| `Optimizer/Robust` | `true` | robust graph optimization for loop closures |
+| `Reg/Force3DoF` | `false` | full 6-DOF (the car pitches/rolls slightly on CARLA terrain) |
+| `Vis/MinInliers` | `20` | min inliers to accept a loop closure |
+| `Kp/MaxFeatures` / `Vis/MaxDepth` | `250` / `20.0 m` | feature budget and stereo depth cutoff |
+| `Stereo/MinDisparity` | `2.0` | reject far/near-infinite-depth matches (recall depth $\propto 1/d$) |
+
+RTAB's loop-closure correction is applied back onto the VINS odom and republished as
+`/rtabmap/corrected_odom` (usable as the MPC state).
 
 ### 4.3 Experiment setup
 
