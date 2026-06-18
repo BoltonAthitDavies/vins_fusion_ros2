@@ -422,6 +422,22 @@ where $d_t$ = distance to the target point, $e_{\text{los},t} = \mathrm{atan2}(\
 (terminal-heading error). The $(1 + 0.08\,t)$ factor makes later steps count more (lookahead); the
 $3.0\,d_H^2$ term strongly pulls the final pose onto the target.
 
+In LQR/MPC terms the coefficients above are diagonal **input ($R$)**, **state ($Q$)** and **terminal
+($Q_f$)** weights — there is no Riccati/QP solve (this is a sampling MPC, §below), so they act as
+scalar tuning gains rather than solver matrices:
+
+$$
+R = \mathrm{diag}\big(\underbrace{0.12}_{\delta},\; \underbrace{1.2}_{\Delta\delta},\; \underbrace{0.04}_{\hat{a}}\big), \qquad
+Q = \mathrm{diag}\big(\underbrace{1.8\,(1{+}0.08\,t)}_{d_t},\; \underbrace{1.2}_{e_{\text{los}}},\; \underbrace{0.25}_{e_{\text{tgt}}},\; \underbrace{0.45}_{v-v_{\text{target}}}\big), \qquad
+Q_f = \underbrace{3.0}_{d_H}
+$$
+
+where $\hat{a} = a/(a_{\text{acc}}+a_{\text{dec}})$. The dominant $R$ term is the steer-**rate** weight
+($1.2$, 10× the steer-magnitude weight) — the controller prizes smooth steering over small steering;
+the dominant $Q$ term is position tracking ($1.8$, ramped by lookahead), reinforced by $Q_f = 3.0$ at
+the horizon. All weights are hardcoded literals in
+[`mpc.hpp`](src/carla_cpp/mpc.hpp) (`rolloutCost`) — tuning them means editing the source and rebuilding.
+
 **4. Control mapping → CARLA** (the winning $\delta^{\ast}, a^{\ast}$; $\mathrm{smooth}(\cdot)$ = ENU→CARLA
 sign flip, rate-limited $1.8/\text{s}$, $\alpha = 0.35$ low-pass). Here $v_c$ = cruise speed (config
 `target_speed`), $d$ = distance to the target and $d_{\text{tol}} = 0.75\,\text{m}$ = goal tolerance:
