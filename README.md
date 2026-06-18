@@ -513,6 +513,77 @@ over. Two helpers make a VINS estimate usable as the MPC state:
 Drive modes (`drive:=`): `coverage` (Traffic-Manager loop route, ignores lights — for map coverage),
 `autopilot` (plain Traffic Manager), `trajectory` (MPC follows `/carla/ego_vehicle/trajectory_cmd`).
 
+### Configuration (parameters & defaults)
+
+All MPC parameters are hardcoded defaults in [`mpc.hpp`](src/carla_cpp/mpc.hpp); only `horizon` and
+`target_speed` are exposed as launch arguments (everything else needs a source edit + rebuild). The
+cost weights ($Q$/$R$) are listed in the cost block above.
+
+**Model & horizon**
+
+| Parameter | Symbol | Default | Role | Set via |
+|-----------|--------|---------|------|---------|
+| `wheelbase_` | $L$ | 2.875 m | bicycle wheelbase (Tesla Model 3) | hardcoded |
+| `dt_` | $dt$ | 0.10 s | rollout prediction step | hardcoded |
+| `horizon_` | $H$ | 100 steps (10 s) | rollout length ($H\,dt$) | **`horizon:=`** |
+
+**Speed & acceleration limits**
+
+| Parameter | Symbol | Default | Role | Set via |
+|-----------|--------|---------|------|---------|
+| `target_speed_` | $v_c$ | 3.5 m/s | cruise speed | **`target_speed:=`** |
+| `max_speed_` | $v_{\max}$ | 8.0 m/s | speed clamp | hardcoded |
+| `max_accel_` | $a_{\text{acc}}$ | 2.0 m/s² | max acceleration | hardcoded |
+| `max_decel_` | $a_{\text{dec}}$ | 4.0 m/s² | max deceleration (and braking-distance cap) | hardcoded |
+| `goal_tol_` | $d_{\text{tol}}$ | 0.75 m | goal tolerance (brake to stop within) | hardcoded |
+| `max_throttle_` | — | 0.45 | throttle command clamp | hardcoded |
+
+**Steering**
+
+| Parameter | Symbol | Default | Role | Set via |
+|-----------|--------|---------|------|---------|
+| `max_steer_angle_` | $\delta_{\max}$ | 0.60 rad | max physical steering angle | hardcoded |
+| `max_norm_steer_` | — | 0.65 | max normalized steer command $\delta$ | hardcoded |
+| `steering_sign_` | — | −1.0 | ENU→CARLA steer sign flip | hardcoded |
+| `steer_rate_limit_` | — | 1.8 /s | steering slew-rate limit | hardcoded |
+| `steer_filter_alpha_` | $\alpha$ | 0.35 | steering low-pass coefficient | hardcoded |
+| `steer_smooth_w_` | — | 1.2 | steer-rate cost weight (the $R$ term on $\Delta\delta$) | hardcoded |
+
+**Candidate set** — 7 steer × 6 accel = **42 rollouts/cycle**: steer offsets
+$\{-0.30, -0.18, -0.09, 0, 0.09, 0.18, 0.30\}$ around the previous command, accel
+$\{-a_{\text{dec}}, -\tfrac{1}{2}a_{\text{dec}}, a_{\text{des}}, 0, \tfrac{1}{2}a_{\text{acc}}, a_{\text{acc}}\}$.
+
+> The node-level launch args that *drive* the MPC but are not in `mpc.hpp` — `mpc_state` (state
+> source), `bootstrap_secs`, `noise_odom`, `drive` — are documented under the bootstrap/handover and
+> drive-mode notes above.
+
+### Related work: sampling-based MPC and the Dynamic Window Approach
+
+Our controller belongs to the **sample-and-evaluate** family of local planners: discretize the control
+space, integrate the vehicle model forward, score each candidate, apply the best — no QP/NLP solve.
+Two classic references bracket where it sits.
+
+- **Dynamic Window Approach** (Fox, Burgard & Thrun, 1997) — samples *velocities* $(v, \omega)$ for a
+  synchro-drive robot, evaluates one short interval, and maximizes
+  $G = \alpha\,\text{heading} + \beta\,\text{dist} + \gamma\,\text{vel}$. It is fundamentally a
+  *reactive collision-avoidance* method; its admissible-velocity rule
+  $v \le \sqrt{2\,\text{dist}\cdot \dot v_b}$ is the same $\sqrt{2 a d}$ braking-distance limit we use in
+  [`targetSpeedForDistance`](src/carla_cpp/mpc.hpp#L74-L79) — except we brake for the **goal**, it brakes
+  for the **nearest obstacle**.
+- **Sampling-Based MPC / SBMPC** (Dunlap, Collins & Caldwell, 2008) — shares our exact philosophy
+  ("sample the input space, integrate the nonlinear model, avoid the local minima of NLP"), our
+  Ackermann/bicycle model, and our $Q$/$R$ tracking-cost form. But SBMPC wraps the sampling in an
+  **A\* tree search over input *sequences*** that plans all the way to the goal around obstacles
+  (resolution-complete); we instead do a **flat, single-shot enumeration** of constant-input rollouts
+  each cycle.
+
+So this MPC sits **between** the two: the enumerate-and-score loop of DWA, with the genuine multi-step
+bicycle rollout and $Q$/$R$ reference tracking of SBMPC — but **without** SBMPC's A\* tree or either
+method's obstacle avoidance (it follows a reference path assuming a clear lane). The natural extension,
+if obstacle avoidance is ever needed, is exactly what both papers add: a **clearance term** in the cost
+plus an **admissible / safe-stop prune** (DWA), or an **A\* sequence search** to plan around obstacles
+(SBMPC).
+
 ---
 
 ## 6. Traffic-light detection
