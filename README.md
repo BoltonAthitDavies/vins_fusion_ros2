@@ -21,7 +21,7 @@ components:
 1. [Problem statement](#1-problem-statement)
 2. [Environment setup](#2-environment-setup)
 3. [Ego vehicle](#3-ego-vehicle-kinematics-state-input-sensors)
-4. [SLAM (VINS-Fusion): equations, online/offline/live setup, results, analysis](#4-slam-vins-fusion)
+4. [SLAM (VINS-Fusion): equations, config rationale, online/offline/live setup, results, analysis](#4-slam-vins-fusion)
 5. [MPC: equations & method](#5-mpc-model-predictive-control)
 6. [Traffic-light detection](#6-traffic-light-detection)
 7. [Integration (SLAM + MPC + traffic light)](#7-integration)
@@ -203,7 +203,7 @@ $$
 
 **IMU preintegration residual** $r_{\mathcal{B}}$ couples two keyframes through the preintegrated
 $\hat{\alpha},\hat{\beta},\hat{\gamma}$ ($g^w$ = gravity). This is the block that fails on CARLA
-(see §4.5):
+(see §4.6):
 
 $$
 r_{\mathcal{B}} =
@@ -239,9 +239,48 @@ The GPS factor anchors **absolute** position (kills long-term drift); the relati
 the locally-smooth VIO **shape**. This is exactly why the GPS variants stay bounded where pure VO/VIO
 drift away.
 
-### 4.2 Experiment setup
+### 4.2 Configuration — reading the CARLA environment into the config
 
-Four estimator variants, each run **5 times** per scene, across **three data paths** (§4.3):
+Every non-default value in our config is justified by a *property of the CARLA sensor rig*, not
+guesswork. The files are [`carla_stereo.yaml`](config/carla/carla_stereo.yaml) and
+[`carla_stereo_imu.yaml`](config/carla/carla_stereo_imu.yaml); below is what we changed from the stock
+VINS-Fusion (EuRoC) template and **why CARLA makes that the right choice**.
+
+| Parameter | Stock (EuRoC) | Ours (CARLA) | Reason — what we know about the CARLA rig |
+|-----------|---------------|--------------|-------------------------------------------|
+| camera model | MEI/fisheye, nonzero $k_1,k_2,p_1,p_2$ | `PINHOLE`, distortion all 0 | CARLA's `sensor.camera.rgb` renders an **ideal pinhole** — there is physically no lens distortion to model |
+| $f_x,f_y,c_x,c_y$ | from calibration | $f{=}480$, $(c_x,c_y){=}(480,360)$ | intrinsics are **exact**, not measured: $f = W/2\tan(\text{FOV}/2) = 960/2\tan 45° = 480$; principal point = image center |
+| `body_T_cam0/1` | measured drone extrinsics | exact rig (fwd 1.5, $y{=}\pm0.25$, baseline 0.5 m) | we *place* the cameras in the sim, so the extrinsic is **known to machine precision** — no tape-measure error |
+| `estimate_extrinsic` | 0 | 0 | extrinsics are exact, so there is nothing to refine — let VINS trust them and spend its DOF elsewhere |
+| `estimate_td` / `td` | 0 / 0 | 0 / 0 | **synchronous** sim: camera and IMU are stamped off the *same* tick, so the cam–IMU time offset is exactly 0 |
+| `acc_n,gyr_n` | 0.1 / 0.01 | 0.00147 / 0.000244 | the sim IMU is **noise-free**; we use tiny BNO055-datasheet floors instead of EuRoC's real-MEMS noise |
+| `acc_w,gyr_w` | 0.001 / 0.0001 | 0.0005 / 0.00002 | same reasoning — minimal bias random-walk for a clean sim IMU |
+| `max_num_iterations` | 8 | 100 | EuRoC's 8 is a **real-time** cap; most of our evaluation is **offline** (`vins_bag_reader`), so we let Ceres fully converge for the accuracy ceiling |
+| `max_solver_time` | 0.04 | 0.08 | headroom for the heavier solve (still keeps up live) |
+| `keyframe_parallax` | 10.0 | 5.0 | CARLA streets are wide and feature-sparse; a lower parallax threshold keeps **more keyframes** so the window isn't starved |
+| `image_skip` | (default 2) | 1 | process **every** frame — the default skip-2 created a frame-skip race that broke run-to-run determinism |
+
+**The two choices that encode the most CARLA understanding:**
+
+- **Zero distortion + exact intrinsics/extrinsics + `estimate_*: 0`.** On a real rig, calibration is
+  the hardest and noisiest part of VINS setup. In CARLA the geometry is *given* — we render the
+  cameras — so we hand VINS the exact model and tell it **not** to waste degrees of freedom
+  re-estimating calibration. (Mounting detail: cam0 = left at body $y=+0.25$, cam1 = right at
+  $y=-0.25$; getting this L/R assignment wrong is exactly the
+  [camera-swap bug](#frame-convention-carla--rosenu) that broke live VINS.)
+- **`estimate_td: 0`.** Real sensors need online temporal calibration because camera and IMU run on
+  independent clocks. CARLA's synchronous mode emits every sensor from the **same** sim tick, so
+  $td \equiv 0$ — estimating it would only inject noise.
+
+**One honest caveat.** The tight IMU noise values are the physically-correct description of a
+noise-free sim IMU, but they do **not** rescue stereo+IMU on smooth driving — that failure is an
+*observability* degeneracy (§4.6), not a noise-model error, and no `acc_n`/`gyr_n` setting fixes it.
+We keep the datasheet values because they honestly describe the sensor, not because they change the
+divergence.
+
+### 4.3 Experiment setup
+
+Four estimator variants, each run **5 times** per scene, across **three data paths** (§4.4):
 
 | Variant | Sensors | Pipeline |
 |---------|---------|----------|
@@ -253,7 +292,7 @@ Four estimator variants, each run **5 times** per scene, across **three data pat
 Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metrics = **APE RMSE** (Umeyama-aligned absolute
 trajectory error) and **5-run spread** (run-to-run determinism); `DIV` = diverged (> 10⁴ m).
 
-### 4.3 Online vs offline vs live — setup, data flow, timeflow
+### 4.4 Online vs offline vs live — setup, data flow, timeflow
 
 The **same VINS code** runs in all three. What differs is *how* the stereo/IMU/GPS streams reach it
 and *which clock* drives time — and that alone changes determinism, speed, and what the result means.
@@ -269,7 +308,7 @@ and *which clock* drives time — and that alone changes determinism, speed, and
 
 **Online** — `ros2 bag play` republishes topics at wall-clock × rate; VINS subscribes over DDS. If
 the estimator can't keep up, frames are **dropped**, and which ones drop varies run-to-run → the
-non-determinism seen in §4.4.
+non-determinism seen in §4.5.
 
 ```
  rosbag ──ros2 bag play --clock -r 1.0──▶ /clock  (time = wall-clock × rate)
@@ -309,7 +348,7 @@ estimate is in the control loop — the only path where SLAM error actually affe
 timing jitter. Live is the real system, where the estimate also steers — so a divergence there (the
 IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or control.
 
-### 4.4 Results
+### 4.5 Results
 
 **`town01_normal`** — easy baseline (APE RMSE [m] / 5-run spread [m]):
 
@@ -346,7 +385,7 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 |---|---|
 | ![direct town01](figures/track_direct_town01_normal.png) | ![direct alwaysrun](figures/track_direct_town10_alwaysrun.png) |
 
-### 4.5 Analysis — key findings
+### 4.6 Analysis — key findings
 
 1. **GPS is the single biggest accuracy win.** On every normal-speed scene the GPS variants are the
    most accurate (sub-metre offline/live), and they stay bounded where pure VO/VIO diverges.
