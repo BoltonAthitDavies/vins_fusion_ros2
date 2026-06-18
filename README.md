@@ -72,7 +72,7 @@ tracks a reference path, and gates throttle/brake on a camera-based traffic-ligh
 | Map | `Town10HD` (primary), `Town01` |
 | Ego | `vehicle.tesla.model3` |
 | Optimizer | **Ceres 2.2** (Manifold API) |
-| Vision | **OpenCV 4.10 + CUDA** built in `~/local` (GPU feature tracking) |
+| Vision | **OpenCV 4.10 + CUDA** built in `~/local` (GPU *available*, but runs **CPU by default** — `use_gpu: 0`) |
 | 3D mapping | apt **`rtabmap_ros`** (run under a clean `LD_LIBRARY_PATH` to avoid an ABI clash with `~/local`) |
 | Packages | `vins_fusion_ros2`, `global_fusion`, `tf_detect` |
 
@@ -183,6 +183,13 @@ $$
 
 VINS-Fusion is a **tightly-coupled, optimization-based** estimator: pose estimation = minimizing a
 sum of Mahalanobis residuals over a sliding window of recent keyframes (it is **not** a filter).
+
+**Pipeline.** The **front end** tracks point features by KLT optical flow (`max_cnt: 150` features,
+`min_dist: 30` px spacing, `flow_back: 1` = forward-backward consistency check). The **back end** runs
+a sliding-window **bundle adjustment** over the most recent keyframes (10 in VINS-Fusion) with Ceres;
+when a keyframe leaves the window it is **marginalized** into the prior $r_p$ so old information is
+kept without unbounded growth. GPS, when enabled, is a **separate** pose-graph stage (`global_fusion`,
+below). The state, cost, and residuals that follow describe that back-end optimization.
 
 **State** — sliding window of $n{+}1$ keyframes and $m$ features. Each keyframe state $x_k$ holds
 position, velocity, orientation, accelerometer bias and gyro bias; $x_c$ is the camera↔IMU extrinsic;
@@ -339,6 +346,26 @@ Four estimator variants, each run **5 times** per scene, across **three data pat
 Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metrics = **APE RMSE** (Umeyama-aligned absolute
 trajectory error) and **5-run spread** (run-to-run determinism); `DIV` = diverged (> 10⁴ m).
 
+**The three scenes** (each a CARLA-autopilot drive, recorded once then replayed/observed through all
+three paths):
+
+| Scene | Map | Source bag | Duration | Route | Character |
+|-------|-----|------------|:--------:|-------|-----------|
+| `town01_normal` | Town01 | `town01_drivenormal` | 39.5 s | ~190 m segment, ~5 m/s | easy, well-conditioned baseline |
+| `town10_normal` | Town10HD | `noimunoise` | 114.7 s | **~442 m loop**, ~5.4 m/s | normal-speed urban loop — **smooth** (the degenerate motion) |
+| `town10_alwaysrun` | Town10HD | `alwaysdrive` | 110.4 s | ~442 m loop, continuous | **never stops** — varied accel/braking/turning |
+
+The town10 loop is ~442 m (measured from GT). The only difference between the two town10 scenes is the
+**motion profile** — `alwaysrun` keeps the car continuously maneuvering, which is exactly what makes
+the IMU observable there but not on the smooth `normal` drive (§4.6). For the **live** town10 runs the
+car is driven on GT around the same loop (~82 s, mean 5.4 m/s) while the four VINS variants observe
+passively.
+
+> **Initialization note.** VINS-Fusion needs a **moving** start: visual-inertial init must observe
+> scale and biases from parallax + IMU excitation, so a *stationary* start initializes, immediately
+> NaNs, and re-initializes in a loop (observed 54× on a still-start bag). Every dataset here starts in
+> motion — the always-moving bags give a clean 1 init, 0 re-inits.
+
 ### 4.4 Online vs offline vs live — setup, data flow, timeflow
 
 The **same VINS code** runs in all three. What differs is *how* the stereo/IMU/GPS streams reach it
@@ -424,6 +451,11 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 | stereo+gps | DIV / — | 0.5 / 1.19 |
 | **stereo+imu+gps** | 171.9 / 593 | **0.3 / 0.24** |
 
+> **Caveat on the town10 *online* columns.** They were recorded with the **previous** (pre-winner)
+> config and have not been re-run, so they read worse than the offline/live columns and are **not a
+> like-for-like** online-vs-offline comparison on town10. The offline and live columns use the current
+> config; town01 online/offline are both current.
+
 | Live tracking (town10_normal) | Divergence onset (town10_normal) |
 |---|---|
 | ![live track](figures/track_live_town10_normal.png) | ![live onset](figures/onset_live_town10_normal.png) |
@@ -455,7 +487,9 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
    deterministic** in real time (0.6 m and 0.3 m). Both IMU variants diverge on **all 5** live runs —
    which rules out a control/timing artifact and points squarely at the degeneracy above.
 5. The estimator itself is deterministic; non-determinism only appears in `global_fusion` when it is
-   fed a marginal/diverged estimate. Real-time performance: ~3.3 ms/frame on CPU (backlog 0).
+   fed a marginal/diverged estimate. Real-time performance: **~3.3 ms/frame on CPU** (backlog 0) — and
+   note the front end runs **CPU**, not GPU: the CUDA path measured *slower* (~5 ms) at this
+   resolution/feature budget, so `use_gpu: 0` is the deliberate default.
 
    ![perf](figures/perf_ab.png)
 
