@@ -377,7 +377,7 @@ and *which clock* drives time — and that alone changes determinism, speed, and
 | Clock (time base) | wall-clock × rate, via `/clock` | message `header.stamp` | CARLA sim tick |
 | Delivery | async DDS pub/sub (**lossy**) | synchronous, in-order (**lossless**) | synchronous sensor callbacks |
 | Speed | real-time (1×) | **~10× faster** | real-time |
-| Determinism | **no** (timing-dependent) | **yes** (bit-identical) | yes (after camera-swap + rate fix) |
+| Determinism | **no** (timing-dependent) | **yes**, config-dependent (bit-identical single-thread; ~0.3 m multi-thread) | yes (after camera-swap + rate fix) |
 | What it means | what you'd get live | best-case accuracy ceiling | the real closed-loop system |
 
 **Online** — `ros2 bag play` republishes topics at wall-clock × rate; VINS subscribes over DDS. If
@@ -394,12 +394,13 @@ non-determinism seen in §4.5.
 
 **Offline** — `vins_bag_reader` opens the bag with `rosbag2_cpp::SequentialReader` and feeds **every**
 message straight into VINS in `header.stamp` order. Nothing is dropped, time comes from the stamps,
-and with the RANSAC RNG seeded the result is **bit-identical** every run and ~10× faster than playback.
+and with single-thread + seeded RANSAC the result is **bit-identical** every run (multi-threaded it is
+*near*-deterministic, ~0.3 m); either way ~10× faster than playback.
 
 ```
  rosbag ──SequentialReader (direct read)──▶ messages in header.stamp order
                                             └─ hand EACH frame directly into VINS ─▶ CSV
-   time = header.stamp · no DDS · no drops · seeded RANSAC ⇒ bit-identical, ~10× real-time
+   time = header.stamp · no DDS · no drops · seeded RANSAC ⇒ reproducible (bit-identical single-thread), ~10× real-time
 ```
 
 **Live** — the native CARLA C++ node runs the simulator in **synchronous mode**: each `tick()`
@@ -428,33 +429,52 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 
 | Variant | online | offline |
 |---------|:------:|:------:|
-| stereo | 20.6 / 0.000 | 20.6 / 0.000 |
-| stereo+imu | 22.8 / 7.2 | 80.1 / 0.000 |
-| stereo+gps | 10.8 / 17.1 | 1.3 / 0.000 |
-| **stereo+imu+gps** | 1.5 / 2.6 | **0.5 / 0.000** |
+| stereo | 20.6 / 0.000 | **0.48 / 0.42** |
+| stereo+imu | 22.8 / 7.2 | **11.0 / 7.95** |
+| stereo+gps | 10.8 / 17.1 | **0.25 / 0.02** |
+| **stereo+imu+gps** | 1.5 / 2.6 | **0.20 / 0.00** |
 
 **`town10_normal`** — normal-speed loop (APE RMSE [m]):
 
 | Variant | online | offline | live |
 |---------|:------:|:------:|:----:|
-| stereo | 34.1 | 6.4 | **0.6** |
-| stereo+imu | 1388 | 2182 | **DIV** |
-| stereo+gps | 2.6 | 0.3 | **0.3** |
-| stereo+imu+gps | 173.6 | 121.4 | **DIV** |
+| stereo | 34.1 | **6.4** | **0.6** |
+| stereo+imu | 1388 | **1423** | **DIV** |
+| stereo+gps | 2.6 | **0.26** | **0.3** |
+| stereo+imu+gps | 173.6 | **22.3** | **DIV** |
 
 **`town10_alwaysrun`** — continuous, varied motion (APE RMSE [m] / spread [m]):
 
 | Variant | online | offline |
 |---------|:------:|:------:|
-| stereo | DIV / — | 9.3 / 16.1 |
-| stereo+imu | 920 / 3.3 | 27.2 / 165 |
-| stereo+gps | DIV / — | 0.5 / 1.19 |
-| **stereo+imu+gps** | 171.9 / 593 | **0.3 / 0.24** |
+| stereo | DIV / — | **12.8 / 0.33** |
+| stereo+imu | 920 / 3.3 | **5.0 / 2.36** |
+| stereo+gps | DIV / — | **0.35 / 0.00** |
+| **stereo+imu+gps** | 171.9 / 593 | **0.25 / 0.00** |
 
-> **Caveat on the town10 *online* columns.** They were recorded with the **previous** (pre-winner)
-> config and have not been re-run, so they read worse than the offline/live columns and are **not a
-> like-for-like** online-vs-offline comparison on town10. The offline and live columns use the current
-> config; town01 online/offline are both current.
+> **Caveats on the tables.** (1) The **offline** columns are the **latest re-collection** (current
+> config, with orientation logged — see the yaw table below); the **online** columns are older and
+> read worse, so online-vs-offline is **not** strictly like-for-like (especially the town10 online
+> columns, still pre-winner config). (2) **Determinism:** this offline collection is **not**
+> bit-identical (spreads ~0.2–0.4 m for bounded variants, not 0.000) — it was run with
+> `multiple_thread: 1`; the earlier bit-identical result used single-thread + seeded RANSAC.
+
+**Direct-mode heading error** (yaw RMSE, deg; frame-independent — best constant yaw offset removed,
+the rotational analog of the Umeyama position alignment). Now available because the offline writer
+logs the quaternion (§[Commands](#9-commands)):
+
+| Variant | town01_normal | town10_normal | town10_alwaysrun |
+|---------|:-------------:|:-------------:|:----------------:|
+| stereo | **0.2°** | **1.9°** | 6.5° |
+| stereo+imu | 4.1° | 67.7° † | 2.6° |
+| stereo+gps | **0.6°** | **94.3°** ‡ | **77.2°** ‡ |
+| stereo+imu+gps | 4.6° | 71.6° | 34.9° ‡ |
+
+† diverged in position (1423 m), so heading is meaningless too.
+‡ **`global_fusion` heading is unreliable on the town10 loop**: GPS pins *position* (sub-metre) but
+heading is only weakly observable from position alone, so the GPS variants show sub-metre position
+with **erratic orientation** on town10 (yaw sweeps ~630° vs GT's 360°) — while on the town01 route the
+same pipeline is fine (0.6°). A real loosely-coupled-fusion property, not a metric artifact.
 
 | Live tracking (town10_normal) | Divergence onset (town10_normal) |
 |---|---|
@@ -468,8 +488,10 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 
 1. **GPS is the single biggest accuracy win.** On every normal-speed scene the GPS variants are the
    most accurate (sub-metre offline/live), and they stay bounded where pure VO/VIO diverges.
-2. **Pure stereo is the most *repeatable*** (bit-identical across 5 runs offline) but **never the most
-   accurate**, and it can diverge on low-excitation motion.
+2. **Pure stereo is the most *repeatable*** (smallest run-to-run spread) but **never the most
+   accurate**, and it can diverge on low-excitation motion. (Determinism is **config-dependent**: with
+   single-thread + seeded RANSAC the offline runs were bit-identical; the latest `multiple_thread: 1`
+   collection is *near*-deterministic — ~0.2–0.4 m spread — not bit-identical.)
 3. **The IMU paths diverge on smooth, normal driving** — and this is a **fundamental visual-inertial
    observability degeneracy**, not a tuning bug. CARLA's smooth, planar, low-rotation motion leaves
    the IMU-coupled states (velocity, accel/gyro bias, gravity) unobservable. This is corroborated
@@ -492,6 +514,14 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
    resolution/feature budget, so `use_gpu: 0` is the deliberate default.
 
    ![perf](figures/perf_ab.png)
+
+6. **Good position ≠ good heading for the GPS variants.** Now that offline logs orientation, the yaw
+   table shows `global_fusion` delivers sub-metre *position* but **unreliable heading on the town10
+   loop** (~77–94° yaw RMSE) — GPS constrains position, not heading, so in a loosely-coupled pose
+   graph the global yaw is weakly observable. Pure stereo/VIO keep heading well where position holds
+   (town01 ≤ 0.2°), and on town01 the GPS heading is also fine (0.6°); it is specifically the town10
+   route that breaks the fused heading. **Takeaway:** if a downstream consumer needs heading (e.g. the
+   MPC), prefer the raw VIO orientation over the GPS-fused one.
 
 ---
 
