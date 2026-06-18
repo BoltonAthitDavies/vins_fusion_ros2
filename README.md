@@ -476,6 +476,14 @@ heading is only weakly observable from position alone, so the GPS variants show 
 with **erratic orientation** on town10 (yaw sweeps ~630° vs GT's 360°) — while on the town01 route the
 same pipeline is fine (0.6°). A real loosely-coupled-fusion property, not a metric artifact.
 
+Aligned **x, y, and heading-error vs GT over time** (run1; flat = perfect). On town10_normal,
+`stereo+gps` (green) sits on GT in x/y yet its yaw error swings to ±150° — the finding above made
+visual; town01 stays flat in all three:
+
+| town01_normal | town10_normal | town10_alwaysrun |
+|---|---|---|
+| ![xyyaw town01](figures/xyyaw_town01_normal.png) | ![xyyaw town10_normal](figures/xyyaw_town10_normal.png) | ![xyyaw town10_alwaysrun](figures/xyyaw_town10_alwaysrun.png) |
+
 | Live tracking (town10_normal) | Divergence onset (town10_normal) |
 |---|---|
 | ![live track](figures/track_live_town10_normal.png) | ![live onset](figures/onset_live_town10_normal.png) |
