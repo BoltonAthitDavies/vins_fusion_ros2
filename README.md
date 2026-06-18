@@ -101,6 +101,46 @@ source install/setup.bash   # re-source after every build
 
 Cameras are mounted at x = 1.5 m, z = 1.5 m; left at y = −0.25 m, right at y = +0.25 m (CARLA frame).
 
+### Stereo calibration
+
+VINS needs two calibrations: the per-camera **intrinsics** (how 3D rays map to pixels) and the
+**stereo + camera↔body extrinsics** (where each camera sits relative to the IMU/body frame). Because
+the rig lives in CARLA, both are *known exactly* — there is no calibration noise to estimate, so VINS
+runs with `estimate_extrinsic: 0` (extrinsics fixed) and zero distortion.
+
+**Intrinsics** — both cameras are the *same* ideal pinhole. CARLA renders a perfect pinhole from a
+single FOV parameter, so there is **no lens distortion** and the two cameras share one model
+([`cam_front_left.yaml`](config/carla/cam_front_left.yaml),
+[`cam_front_right.yaml`](config/carla/cam_front_right.yaml)):
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| model | `PINHOLE` | CARLA ideal pinhole |
+| resolution | 960 × 720 | sensor config |
+| $f_x = f_y$ | 480.0 px | $f_x = \tfrac{W}{2\tan(\text{FOV}/2)} = \tfrac{960}{2\tan 45°} = 480$ |
+| $(c_x, c_y)$ | (480.0, 360.0) | image center |
+| $k_1, k_2, p_1, p_2$ | 0, 0, 0, 0 | no distortion (ideal pinhole) |
+
+**Extrinsics** — the two `body_T_cam` homogeneous transforms in
+[`carla_stereo.yaml`](config/carla/carla_stereo.yaml) place each camera in the body (IMU) frame. The
+common rotation block maps the camera optical frame (x-right, y-down, z-forward) to the body frame
+(x-forward, y-left, z-up); the translation is the camera position in body coordinates:
+
+$$
+{}^{b}T_{c_0} =
+\begin{bmatrix} 0 & 0 & 1 & 1.5 \\ -1 & 0 & 0 & +0.25 \\ 0 & -1 & 0 & 0 \\ 0 & 0 & 0 & 1 \end{bmatrix}
+\text{(left)}, \qquad
+{}^{b}T_{c_1} =
+\begin{bmatrix} 0 & 0 & 1 & 1.5 \\ -1 & 0 & 0 & -0.25 \\ 0 & -1 & 0 & 0 \\ 0 & 0 & 0 & 1 \end{bmatrix}
+\text{(right)}
+$$
+
+Both cameras sit **1.5 m forward** of the body origin; the left is at $y = +0.25$ m and the right at
+$y = -0.25$ m, for a **stereo baseline of 0.5 m**. (These body-frame $y$ signs are the CARLA values
+$y = \mp0.25$ m negated by the CARLA→ROS convention of §[Frame convention](#frame-convention-carla--rosenu).)
+This is the *winner rig* layout — cam0 = left at $y = +0.25$, cam1 = right at $y = -0.25$ — matched to
+the reference VINS-Fusion-ROS2 configuration.
+
 ### Frame convention (CARLA → ROS/ENU)
 
 CARLA is **left-handed (+y = right, yaw clockwise)**; ROS/ENU is right-handed (+y = left, yaw CCW).
