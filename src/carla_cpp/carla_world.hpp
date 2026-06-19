@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "frame_collector.hpp"
 #include "types.hpp"
@@ -23,6 +24,14 @@ namespace carla_cpp {
 
 class CarlaWorld {
  public:
+  // Ground-truth state of one traffic light, for labelling the perception
+  // experiment (no carla_msgs available, so published as JSON).
+  struct TrafficLightState {
+    uint32_t actor_id = 0;
+    std::string opendrive_id;            // == tf_detect signal_id
+    int state = 4;                       // 0=Red 1=Yellow 2=Green 3=Off 4=Unknown
+  };
+
   struct SpawnPose {
     float x = 0.f, y = 0.f, z = 0.f;      // CARLA world location (meters)
     float roll = 0.f, pitch = 0.f, yaw = 0.f;  // degrees
@@ -60,6 +69,10 @@ class CarlaWorld {
   // Traffic-Manager route + ignore lights/signs + normalize light timing, then
   // hand the ego to autopilot; off -> disable autopilot.
   void setCoverageMode(bool enabled);
+
+  // Ground-truth state of every traffic light in the world (for GT labelling /
+  // confusion matrix of the camera detector). Empty if the world is not set up.
+  std::vector<TrafficLightState> getTrafficLightStates() const;
 
   // Stop sensors, restore asynchronous mode, destroy actors.
   void shutdown();

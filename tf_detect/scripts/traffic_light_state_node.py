@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -52,6 +53,12 @@ ACTION_BY_STATE = {
     "yellow": "slow",
     "red": "stop",
 }
+
+# Tokens the temporal filter can COMMIT to (vs "unknown"/"none"). "caution" is the
+# merged red+yellow class used when caution_stop is on: red and yellow both mean
+# "do not go" and are exactly the pair the classifier cannot tell apart, so we
+# confirm/hold them together and stop, instead of flickering red<->yellow forever.
+COMMITTABLE_TOKENS = {"red", "yellow", "green", "caution"}
 
 VALID_ACTIONS = {"go", "slow", "stop"}
 
@@ -122,7 +129,7 @@ class TrafficLightStateNode(Node):
             "camera_info_topic", f"/carla/ego_vehicle/{self.camera_id}/camera_info"
         ).value
         self.odom_topic = self.declare_parameter(
-            "odom_topic", "/carla/ego_vehicle/odometry"
+            "odom_topic", "/vins_stereo_vel/odometry"
         ).value
         self.turn_topic = self.declare_parameter(
             "turn_topic", "/traffic_light/route_turn"
@@ -212,13 +219,46 @@ class TrafficLightStateNode(Node):
         self.yolo_imgsz = int(self.declare_parameter("yolo_imgsz", 640).value)
         self.yolo_class_id = int(self.declare_parameter("yolo_class_id", 9).value)
         self.yolo_device = self.declare_parameter("yolo_device", "").value
-        self.yolo_roi_scale = float(self.declare_parameter("yolo_roi_scale", 5.0).value)
+        self.yolo_roi_scale = float(self.declare_parameter("yolo_roi_scale", 3.5).value)
         self.yolo_min_roi_width = float(
-            self.declare_parameter("yolo_min_roi_width", 160.0).value
+            self.declare_parameter("yolo_min_roi_width", 100.0).value
         )
         self.yolo_min_roi_height = float(
-            self.declare_parameter("yolo_min_roi_height", 180.0).value
+            self.declare_parameter("yolo_min_roi_height", 120.0).value
         )
+
+        # Brightness-position state classifier gates + tuning (see validate_projection).
+        self.min_state_bbox_height_px = float(
+            self.declare_parameter("min_state_bbox_height_px", 25.0).value
+        )
+        self.max_state_distance_m = float(
+            self.declare_parameter("max_state_distance_m", 40.0).value
+        )
+        self.state_score_ratio = float(
+            self.declare_parameter("state_score_ratio", 1.15).value
+        )
+        self.state_x_band_lo = float(self.declare_parameter("state_x_band_lo", 0.30).value)
+        self.state_x_band_hi = float(self.declare_parameter("state_x_band_hi", 0.70).value)
+        self.state_sat_min = float(self.declare_parameter("state_sat_min", 45.0).value)
+
+        # Temporal smoothing.
+        self.state_history_size = max(
+            1, int(self.declare_parameter("state_history_size", 7).value)
+        )
+        self.state_confirm_frames = max(
+            1, int(self.declare_parameter("state_confirm_frames", 3).value)
+        )
+        self.unknown_hold_seconds = float(
+            self.declare_parameter("unknown_hold_seconds", 0.8).value
+        )
+        # Merge red+yellow into one "caution" class for confirmation -> stop. Robust
+        # to red<->yellow flicker (the unreliable distinction); only green can free
+        # the car. Off -> per-colour behaviour (red=stop, yellow=slow).
+        self.caution_stop = bool(self.declare_parameter("caution_stop", True).value)
+        self.state_history: deque = deque(maxlen=self.state_history_size)
+        self.smoothed_state = "none"
+        self.last_known_state = "none"
+        self.last_known_time: Optional[float] = None
 
         self.publish_debug_image = bool(
             self.declare_parameter("publish_debug_image", True).value
@@ -251,6 +291,46 @@ class TrafficLightStateNode(Node):
         self.camera_y_offset = float(self.declare_parameter("camera_y_offset", 0.0).value)
         self.camera_z_offset = float(self.declare_parameter("camera_z_offset", 0.0).value)
         self.camera_y_sign = self.declare_parameter("camera_y_sign", "as-is").value
+        self.expected_odom_frame_id = self.declare_parameter(
+            "expected_odom_frame_id", "world"
+        ).value
+        self.expected_odom_child_frame_id = self.declare_parameter(
+            "expected_odom_child_frame_id", "body"
+        ).value
+        self.odom_map_x_offset = float(
+            self.declare_parameter("odom_map_x_offset", 0.0).value
+        )
+        self.odom_map_y_offset = float(
+            self.declare_parameter("odom_map_y_offset", 0.0).value
+        )
+        self.odom_map_z_offset = float(
+            self.declare_parameter("odom_map_z_offset", 0.0).value
+        )
+        self.odom_map_yaw_offset_deg = float(
+            self.declare_parameter("odom_map_yaw_offset_deg", 0.0).value
+        )
+        self.rotation_map_odom = vp.rotation_z(math.radians(self.odom_map_yaw_offset_deg))
+        self.position_map_offset = np.array(
+            [
+                self.odom_map_x_offset,
+                self.odom_map_y_offset,
+                self.odom_map_z_offset,
+            ],
+            dtype=float,
+        )
+        self.odom_child_to_ego = np.array(
+            [
+                float(self.declare_parameter("odom_child_to_ego_x", 0.0).value),
+                float(self.declare_parameter("odom_child_to_ego_y", 0.0).value),
+                float(self.declare_parameter("odom_child_to_ego_z", 0.0).value),
+            ],
+            dtype=float,
+        )
+        self.rotation_child_ego = vp.rotation_from_rpy_degrees(
+            float(self.declare_parameter("odom_child_to_ego_roll_deg", 0.0).value),
+            float(self.declare_parameter("odom_child_to_ego_pitch_deg", 0.0).value),
+            float(self.declare_parameter("odom_child_to_ego_yaw_deg", 0.0).value),
+        )
 
         self.signals, self.references = vp.parse_opendrive(
             self.map_path,
@@ -396,17 +476,42 @@ class TrafficLightStateNode(Node):
         )
 
     def odom_callback(self, message: Odometry) -> None:
+        if (
+            self.expected_odom_frame_id
+            and message.header.frame_id
+            and message.header.frame_id != self.expected_odom_frame_id
+        ):
+            self.get_logger().warn(
+                f"odom frame_id is {message.header.frame_id!r}, "
+                f"expected {self.expected_odom_frame_id!r}",
+                throttle_duration_sec=5.0,
+            )
+        if (
+            self.expected_odom_child_frame_id
+            and message.child_frame_id
+            and message.child_frame_id != self.expected_odom_child_frame_id
+        ):
+            self.get_logger().warn(
+                f"odom child_frame_id is {message.child_frame_id!r}, "
+                f"expected {self.expected_odom_child_frame_id!r}",
+                throttle_duration_sec=5.0,
+            )
         position = message.pose.pose.position
         orientation = message.pose.pose.orientation
+        raw_position = np.array([position.x, position.y, position.z], dtype=float)
+        raw_rotation = vp.rotation_from_quaternion(
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        )
+        ego_position_in_odom = raw_position + raw_rotation @ self.odom_child_to_ego
+        ego_rotation_in_odom = raw_rotation @ self.rotation_child_ego
         self.last_odom = vp.OdomSample(
             timestamp_ns=stamp_to_ns(message.header.stamp),
-            position_map=np.array([position.x, position.y, position.z], dtype=float),
-            rotation_map_ego=vp.rotation_from_quaternion(
-                orientation.x,
-                orientation.y,
-                orientation.z,
-                orientation.w,
-            ),
+            position_map=self.rotation_map_odom @ ego_position_in_odom
+            + self.position_map_offset,
+            rotation_map_ego=self.rotation_map_odom @ ego_rotation_in_odom,
         )
         self.last_odom_stamp_ns = self.last_odom.timestamp_ns
 
@@ -448,16 +553,29 @@ class TrafficLightStateNode(Node):
 
         debug_image = image.copy()
         candidates = self._select_candidates(self.last_odom)
-        state, action, status = self._evaluate_candidates(
+        raw_state, status = self._evaluate_candidates(
             image,
             debug_image,
             self.last_odom,
             candidates,
         )
+
+        now_sec = (
+            image_stamp_ns / 1e9
+            if image_stamp_ns > 0
+            else self.get_clock().now().nanoseconds / 1e9
+        )
+        token = self._smooth_state(raw_state, now_sec)
+        state = self._display_state(token)
+        action = self._action_for(token)
+
         status.update(
             {
                 "state": state,
+                "state_class": token,
+                "raw_state": raw_state,
                 "action": action,
+                "state_history": list(self.state_history),
                 "route_turn": self.route_turn or "auto",
                 "candidate_mode": self.candidate_mode,
                 "image_stamp_ns": image_stamp_ns,
@@ -469,6 +587,7 @@ class TrafficLightStateNode(Node):
         self.action_pub.publish(String(data=action))
         self.status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
         if self.debug_image_pub is not None:
+            self._draw_state_banner(debug_image, state, raw_state, action, status)
             self.debug_image_pub.publish(bgr_to_ros_image(debug_image, message))
 
     def _select_candidates(self, odom: vp.OdomSample) -> List[vp.Candidate]:
@@ -553,11 +672,11 @@ class TrafficLightStateNode(Node):
         debug_image: np.ndarray,
         odom: vp.OdomSample,
         candidates: Sequence[vp.Candidate],
-    ) -> Tuple[str, str, Dict[str, object]]:
+    ) -> Tuple[str, Dict[str, object]]:
+        """Return the per-frame RAW (gated, not yet smoothed) state + debug."""
         if not candidates:
             return (
                 "none",
-                self.no_light_action,
                 {
                     "reason": "no_candidate",
                     "candidate_count": 0,
@@ -590,14 +709,24 @@ class TrafficLightStateNode(Node):
                 self.yolo_roi_scale,
                 self.yolo_min_roi_width,
                 self.yolo_min_roi_height,
+                min_state_bbox_height_px=self.min_state_bbox_height_px,
+                max_state_distance_m=self.max_state_distance_m,
+                state_score_ratio=self.state_score_ratio,
+                state_x_band_lo=self.state_x_band_lo,
+                state_x_band_hi=self.state_x_band_hi,
+                state_sat_min=self.state_sat_min,
             )
             for projection in candidate_projections:
                 projections.append((candidate, projection))
 
+        # A "confirmed" projection means YOLO found a light there; its light_state
+        # may still be a colour OR an already-gated "unknown" (too far / too small /
+        # low contrast). We surface the most readable one regardless so temporal
+        # smoothing and the debug status see it.
         confirmed = [
             (candidate, projection)
             for candidate, projection in projections
-            if projection.yolo_status == "confirmed" and projection.light_state in ACTION_BY_STATE
+            if projection.yolo_status == "confirmed"
         ]
         if not confirmed:
             yolo_status = "disabled" if self.yolo_model is None else "not_confirmed"
@@ -605,44 +734,137 @@ class TrafficLightStateNode(Node):
                 yolo_status = projections[0][1].yolo_status
             return (
                 "unknown",
-                self.unknown_action,
                 {
-                    "reason": "no_confirmed_state",
+                    "reason": "no_detection",
                     "candidate_count": len(candidates),
                     "projection_count": len(projections),
                     "yolo_status": yolo_status,
                 },
             )
 
-        def projection_score(item: Tuple[vp.Candidate, vp.ProjectionResult]) -> float:
-            candidate, projection = item
-            state_conf = projection.light_state_confidence or 0.0
-            yolo_conf = projection.yolo_confidence or 0.0
-            return state_conf + 0.25 * yolo_conf - 0.002 * candidate.signal_distance
+        # Most readable detection = biggest YOLO box (closest), tie-break by conf.
+        def readability(item: Tuple[vp.Candidate, vp.ProjectionResult]) -> Tuple[float, float]:
+            _, projection = item
+            return (projection.bbox_height, projection.yolo_confidence or 0.0)
 
-        best_candidate, best_projection = max(confirmed, key=projection_score)
-        state = best_projection.light_state
-        action = ACTION_BY_STATE[state]
+        best_candidate, best_projection = max(confirmed, key=readability)
+        raw_state = best_projection.light_state
         red_score, yellow_score, green_score = best_projection.color_scores
         return (
-            state,
-            action,
+            raw_state,
             {
-                "reason": "confirmed",
+                "reason": best_projection.state_reason,
                 "candidate_count": len(candidates),
                 "projection_count": len(projections),
                 "signal_id": best_candidate.signal.signal_id,
                 "roi_signal_id": best_projection.roi_label,
                 "turn_relation": best_candidate.ref.turn_relation,
-                "distance_to_reference_m": best_candidate.distance_to_ref,
-                "distance_to_signal_m": best_candidate.signal_distance,
+                "distance_m": round(float(best_projection.depth), 2),
+                "distance_to_signal_m": round(float(best_candidate.signal_distance), 2),
+                "bbox_height_px": round(float(best_projection.bbox_height), 1),
                 "yolo_status": best_projection.yolo_status,
                 "yolo_confidence": best_projection.yolo_confidence,
                 "light_state_confidence": best_projection.light_state_confidence,
-                "top_red_score": red_score,
-                "middle_yellow_score": yellow_score,
-                "bottom_green_score": green_score,
+                "raw_state_before_gate": best_projection.raw_light_state,
+                "top_red_score": round(float(red_score), 1),
+                "middle_yellow_score": round(float(yellow_score), 1),
+                "bottom_green_score": round(float(green_score), 1),
+                # Geometric (map-projected) light-head box vs the YOLO box, for the
+                # "YOLO does not frame the 3-lamp housing" analysis (Experiment B).
+                "proj_box": [
+                    round(float(best_projection.u), 1),
+                    round(float(best_projection.v), 1),
+                    round(float(best_projection.box_w), 1),
+                    round(float(best_projection.box_h), 1),
+                ],
+                "yolo_box": (
+                    [round(float(v), 1) for v in best_projection.yolo_box_xyxy]
+                    if best_projection.yolo_box_xyxy is not None
+                    else None
+                ),
+                "diag": best_projection.state_diag or {},
             },
+        )
+
+    def _confirm_token(self, raw_state: str) -> str:
+        """Map a per-frame raw state to the token the temporal filter confirms on.
+        With caution_stop, red and yellow collapse to one 'caution' token so the
+        red<->yellow flicker accumulates toward a single confirmed stop."""
+        if self.caution_stop and raw_state in ("red", "yellow"):
+            return "caution"
+        return raw_state
+
+    def _smooth_state(self, raw_state: str, now: float) -> str:
+        """Temporal smoothing over confirmation TOKENS: only flip to a token after
+        it wins N consecutive frames (or a history majority); hold the last
+        committed token briefly through transient unknowns. Returns the token."""
+        token = self._confirm_token(raw_state)
+        self.state_history.append(token)
+        if token in COMMITTABLE_TOKENS:
+            run = 0
+            for past in reversed(self.state_history):
+                if past == token:
+                    run += 1
+                else:
+                    break
+            count = self.state_history.count(token)
+            majority = count >= self.state_confirm_frames and count * 2 > len(self.state_history)
+            if run >= self.state_confirm_frames or majority:
+                self.smoothed_state = token
+                self.last_known_state = token
+                self.last_known_time = now
+            # otherwise keep the current smoothed_state (do not flip yet)
+        else:  # "unknown" or "none"
+            holding = (
+                self.last_known_state in COMMITTABLE_TOKENS
+                and self.last_known_time is not None
+                and (now - self.last_known_time) <= self.unknown_hold_seconds
+            )
+            self.smoothed_state = self.last_known_state if holding else token
+        return self.smoothed_state
+
+    @staticmethod
+    def _display_state(token: str) -> str:
+        """Map a committed token to a /traffic_light/state value (red/yellow/green/
+        unknown/none). 'caution' is reported as 'red' — the conservative reading,
+        and its action is stop anyway."""
+        return "red" if token == "caution" else token
+
+    def _action_for(self, token: str) -> str:
+        if token == "caution":
+            return "stop"
+        if token in ACTION_BY_STATE:
+            return ACTION_BY_STATE[token]
+        if token == "none":
+            return self.no_light_action
+        return self.unknown_action
+
+    def _draw_state_banner(
+        self,
+        image: np.ndarray,
+        state: str,
+        raw_state: str,
+        action: str,
+        status: Dict[str, object],
+    ) -> None:
+        color = {
+            "red": (0, 0, 255),
+            "yellow": (0, 255, 255),
+            "green": (0, 255, 0),
+        }.get(state, (220, 220, 220))
+        dist = status.get("distance_m")
+        bbox_h = status.get("bbox_height_px")
+        reason = status.get("reason", "")
+        line1 = f"{state.upper()} ({action})  raw={raw_state}"
+        line2 = f"reason={reason}"
+        if dist is not None:
+            line2 += f" d={dist}m"
+        if bbox_h is not None:
+            line2 += f" h={bbox_h}px"
+        cv2.rectangle(image, (0, 0), (image.shape[1], 40), (0, 0, 0), -1)
+        cv2.putText(image, line1, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(
+            image, line2, (6, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA
         )
 
 
