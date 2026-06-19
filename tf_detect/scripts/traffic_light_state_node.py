@@ -255,6 +255,25 @@ class TrafficLightStateNode(Node):
         # to red<->yellow flicker (the unreliable distinction); only green can free
         # the car. Off -> per-colour behaviour (red=stop, yellow=slow).
         self.caution_stop = bool(self.declare_parameter("caution_stop", True).value)
+        # Stop obeying a light once we have turned off the lane it controls: if the
+        # ego heading diverges from the candidate signal's heading by more than this,
+        # ignore it -> action goes to no_light. Recomputed every frame (stateless),
+        # so it can never get stuck. 0 disables the check.
+        self.ignore_turn_heading_deg = float(
+            self.declare_parameter("ignore_turn_heading_deg", 40.0).value
+        )
+        # Stop obeying a light once its head is abeam/overhead/behind: if the angle
+        # from the ego forward direction to the light head exceeds this, ignore it.
+        # Handles the STRAIGHT case (drove just past the light). 0 disables.
+        self.ignore_abeam_angle_deg = float(
+            self.declare_parameter("ignore_abeam_angle_deg", 85.0).value
+        )
+        # Stop obeying a light once we are within this distance of its head (it is
+        # essentially overhead -- too close/late to act on). 0 disables. NOTE: keep
+        # it below the stop-line distance or it will release a red too early.
+        self.ignore_near_distance_m = float(
+            self.declare_parameter("ignore_near_distance_m", 7.0).value
+        )
         self.state_history: deque = deque(maxlen=self.state_history_size)
         self.smoothed_state = "none"
         self.last_known_state = "none"
@@ -565,9 +584,24 @@ class TrafficLightStateNode(Node):
             if image_stamp_ns > 0
             else self.get_clock().now().nanoseconds / 1e9
         )
-        token = self._smooth_state(raw_state, now_sec)
-        state = self._display_state(token)
-        action = self._action_for(token)
+
+        ignore_reason, heading_err_deg, abeam_deg = self._off_lane_check(
+            candidates, self.last_odom
+        )
+        if ignore_reason is not None:
+            # Turned off / drove past the lane this light controls -> stop obeying it.
+            # Clear the temporal history so the next light is judged fresh.
+            self.state_history.clear()
+            self.smoothed_state = "none"
+            self.last_known_state = "none"
+            self.last_known_time = None
+            token = "none"
+            state = "none"
+            action = self.no_light_action
+        else:
+            token = self._smooth_state(raw_state, now_sec)
+            state = self._display_state(token)
+            action = self._action_for(token)
 
         status.update(
             {
@@ -575,6 +609,9 @@ class TrafficLightStateNode(Node):
                 "state_class": token,
                 "raw_state": raw_state,
                 "action": action,
+                "heading_error_deg": heading_err_deg,
+                "abeam_angle_deg": abeam_deg,
+                "ignore_reason": ignore_reason,
                 "state_history": list(self.state_history),
                 "route_turn": self.route_turn or "auto",
                 "candidate_mode": self.candidate_mode,
@@ -786,6 +823,40 @@ class TrafficLightStateNode(Node):
             },
         )
 
+    def _off_lane_check(
+        self, candidates: Sequence[vp.Candidate], odom: vp.OdomSample
+    ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+        """Stateless test for "stop obeying this light", recomputed every frame so it
+        can never get stuck. Two cases:
+          - turned_off_lane: ego heading diverges from the signal heading (a turn).
+          - passed_light:    the light head is now abeam/overhead/behind (the angle
+            from our forward direction to the light head exceeds a threshold) -- the
+            STRAIGHT case where we drove just past it.
+        Returns (ignore_reason|None, heading_err_deg, abeam_angle_deg)."""
+        if not candidates:
+            return None, None, None
+        cand = candidates[0]
+        yaw = vp.odom_yaw(odom)
+        heading_err = math.degrees(vp.angle_error(cand.signal.heading, yaw))
+
+        forward = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+        vector = np.array([cand.signal.x, cand.signal.y], dtype=float) - odom.position_map[:2]
+        distance = float(np.linalg.norm(vector))
+        abeam = (
+            math.degrees(math.acos(clamp(float((vector / distance) @ forward), -1.0, 1.0)))
+            if distance > 1e-6
+            else 0.0
+        )
+
+        reason: Optional[str] = None
+        if self.ignore_turn_heading_deg > 0.0 and heading_err > self.ignore_turn_heading_deg:
+            reason = "turned_off_lane"
+        elif self.ignore_near_distance_m > 0.0 and distance < self.ignore_near_distance_m:
+            reason = "near_light"
+        elif self.ignore_abeam_angle_deg > 0.0 and abeam > self.ignore_abeam_angle_deg:
+            reason = "passed_light"
+        return reason, round(heading_err, 1), round(abeam, 1)
+
     def _confirm_token(self, raw_state: str) -> str:
         """Map a per-frame raw state to the token the temporal filter confirms on.
         With caution_stop, red and yellow collapse to one 'caution' token so the
@@ -855,7 +926,9 @@ class TrafficLightStateNode(Node):
         dist = status.get("distance_m")
         bbox_h = status.get("bbox_height_px")
         reason = status.get("reason", "")
-        line1 = f"{state.upper()} ({action})  raw={raw_state}"
+        ignore_reason = status.get("ignore_reason")
+        tag = f"[IGNORE:{ignore_reason}] " if ignore_reason else ""
+        line1 = f"{tag}{state.upper()} ({action})  raw={raw_state}"
         line2 = f"reason={reason}"
         if dist is not None:
             line2 += f" d={dist}m"

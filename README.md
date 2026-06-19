@@ -11,8 +11,9 @@ components:
    stop / slow / go action.
 
 > **Status.** SLAM is fully evaluated (online vs offline vs live, 4 variants × 5 runs × 3 scenes); the
-> **MPC is tuned** (horizon & lookahead sweeps, §5.1) and the **traffic-light** localization-vs-state
-> behavior is characterized (§6.2). Only the **full closed-loop integration** (§7) is not yet measured.
+> **MPC is tuned** (horizon & lookahead sweeps, §5.1); the **traffic-light** localization-vs-state
+> behavior is characterized (§6.2); and the **full closed loop runs end-to-end** (§7) — stereo VINS →
+> MPC → traffic-light gate, a 439 m lap at 0.81 m cross-track with brake-to-hold stops at red lights.
 
 ---
 
@@ -857,12 +858,37 @@ magnifier + 3-zone overlay** drawn in `debug_image`, and the SE(2) frame calibra
 
 ## 7. Integration
 
-> *To be added.*
+The full closed loop run end-to-end on the town10 loop: **stereo VINS → MPC follows the recorded path
+→ traffic-light gate brakes the car at red lights**. The MPC drove on the **stereo** VINS state
+(GPS-registered into the `map` frame, `/vins_stereo_gps`), at horizon 15, with the traffic-light action
+gating throttle/brake; logged with `mpc_debug_log.py` to `logs/finalresult.csv` (186 s).
 
-The intended closed loop: **VINS state → MPC follows the recorded reference path → traffic-light
-action gates throttle/brake.** All three components run live today (VINS state drives the MPC around a
-full town10 lap; the traffic-light node publishes a stop/go action), but the combined evaluation —
-following a path *and* stopping at lights, end to end — has not yet been measured.
+**Result** — the car completed the lap *and* stopped at the lights:
+
+| Metric | Value |
+|--------|-------|
+| Lap distance (GT) | **439 m** (full loop) — ended 1.4 m from the route end |
+| Path-following x-track | **0.81 m RMSE**, 2.06 m max |
+| Cruise speed | ~5.5 m/s between lights |
+| Traffic-light stops | **2** brake-to-hold events (brake ≈ 0.95, speed → 0): at the spawn junction (~29 s) and a mid-loop junction at (−27, −12) (~41 s) |
+
+![integration](figures/integration_finalresult.png)
+
+The figure shows all three layers working together: the ego (driven on the stereo VINS estimate) tracks
+the reference loop to sub-metre accuracy (top-left, bottom-right), while the speed and control traces
+(top-right, bottom-left) show it cruising at ~5.5 m/s, **braking fully to a hold at each red light**
+(shaded), then resuming — i.e. the SLAM→MPC→traffic-light loop closes.
+
+**Caveats (honest scope).**
+- `mpc_debug_log.py` does **not** record the traffic-light state/action, so the two stops are
+  identified from their *signature* (full brake + speed→0 mid-route), which is exactly what the gate's
+  `stop` action produces — but the log can't independently prove the trigger was the light.
+- Per §6.2, the **camera-only light state is unreliable**, so a dependable gate uses the **ground-truth
+  light state** (`/carla/traffic_lights/gt_status`); this run demonstrates the *control* integration,
+  not camera-based perception of the light.
+- The MPC's *control* topic is the GPS-registered stereo odom (`/vins_stereo_gps`); raw `/vins_stereo`
+  is in the VINS-local frame (≈205 m from `map`) and cannot follow the map-frame path without that
+  registration.
 
 ---
 
@@ -884,11 +910,14 @@ following a path *and* stopping at lights, end to end — has not yet been measu
   ~17–45 px tall at approach range, and all lamps render a similar amber (`lit_rgb ≈ [250,225,100]`) so
   hue cannot separate red from yellow. Reliable state would need a CARLA-trained state classifier,
   higher-resolution capture, or geometric per-lamp sampling (§6.2).
+- **The full loop closes end-to-end** (§7): driven on the stereo VINS state, the MPC completes the
+  439 m town10 lap at **0.81 m cross-track RMSE** and **brakes to a hold at the red lights** — SLAM,
+  control, and the traffic-light gate working together.
 
 **Next steps:** (1) for traffic lights, either train a dedicated CARLA state classifier or fall back to
-geometric per-lamp sampling, then report precision/recall and state-transition latency; (2) close and
-measure the full SLAM + MPC + traffic-light loop (needs the `/traffic_light/action` → MPC speed-gate,
-not yet wired).
+geometric per-lamp sampling, then report precision/recall and state-transition latency, and feed *that*
+(not GT) state into the gate; (2) log the traffic-light state/action alongside the integration run so
+stop events are confirmed from the signal, not inferred.
 
 ---
 
@@ -967,12 +996,12 @@ ros2 launch vins_fusion_ros2 carla_native_multi.launch.py \
 #    trajectory (MPC) on stereo VINS:
 ros2 launch vins_fusion_ros2 carla_native_multi.launch.py \
   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=trajectory \
-  mpc_state:=/vins_stereo_vel/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo
+  mpc_state:=/vins_stereo_vel/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo traffic_light:=true
 
 #    trajectory (MPC) on stereo+gps:
 ros2 launch vins_fusion_ros2 carla_native_multi.launch.py \
   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=trajectory \
-  mpc_state:=/vins_stereo_gps_map/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo_gps
+  mpc_state:=/vins_stereo_gps_map/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo_gps traffic_light:=true
 
 # C: live plot
 python3 plot_result_rtab_cpp.py

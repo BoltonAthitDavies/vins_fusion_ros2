@@ -108,6 +108,17 @@ def generate_launch_description() -> LaunchDescription:
         # Merge red+yellow -> one "caution" class that confirms to STOP (robust to
         # red<->yellow flicker; only green frees the car). false -> red=stop/yellow=slow.
         DeclareLaunchArgument("caution_stop", default_value="true"),
+        # Stop obeying a light once the ego heading diverges from the signal heading
+        # by more than this (deg) -> we have turned off the lane it controls. Stateless
+        # per frame (cannot get stuck). 0 disables.
+        DeclareLaunchArgument("ignore_turn_heading_deg", default_value="40.0"),
+        # Stop obeying a light once its head is abeam/overhead/behind: angle from the
+        # ego forward to the light head exceeds this (deg). Handles the STRAIGHT case
+        # (drove just past the light). Stateless per frame. 0 disables.
+        DeclareLaunchArgument("ignore_abeam_angle_deg", default_value="85.0"),
+        # Stop obeying a light once within this distance of its head (overhead/too
+        # late). 0 disables. Keep below the stop-line distance or it releases red early.
+        DeclareLaunchArgument("ignore_near_distance_m", default_value="5.0"),
     ]
 
     node = Node(
@@ -167,6 +178,9 @@ def generate_launch_description() -> LaunchDescription:
                 "state_confirm_frames": LaunchConfiguration("state_confirm_frames"),
                 "unknown_hold_seconds": LaunchConfiguration("unknown_hold_seconds"),
                 "caution_stop": LaunchConfiguration("caution_stop"),
+                "ignore_turn_heading_deg": LaunchConfiguration("ignore_turn_heading_deg"),
+                "ignore_abeam_angle_deg": LaunchConfiguration("ignore_abeam_angle_deg"),
+                "ignore_near_distance_m": LaunchConfiguration("ignore_near_distance_m"),
                 "candidate_mode": "route_turn",
                 "path_physical_signal_mode": "same-heading",
                 "image_horizontal_sign": "flip",
