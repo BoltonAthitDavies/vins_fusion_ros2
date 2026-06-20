@@ -353,6 +353,15 @@ and *which clock* drives time — and that alone changes determinism, speed, and
 | Determinism | **no** (timing-dependent) | **yes** (bit-identical) | yes (after camera-swap + rate fix) |
 | What it means | what you'd get live | best-case accuracy ceiling | the real closed-loop system |
 
+The two **replay** paths (online vs offline) feed the *same recorded data* to the *same VINS* — the only
+difference is delivery. Online streams over DDS and **drops frames** when the estimator lags (lossy,
+non-deterministic); offline hands **every** message straight in, in `header.stamp` order (lossless,
+deterministic, ~10×). That single difference is the whole story:
+
+![online vs offline data transfer](figures/online_vs_offline.gif)
+
+> Regenerate with [`python figures/make_dataflow_gif.py`](figures/make_dataflow_gif.py).
+
 **Online** — `ros2 bag play` republishes topics at wall-clock × rate; VINS subscribes over DDS. If
 the estimator can't keep up, frames are **dropped**, and which ones drop varies run-to-run → the
 non-determinism seen in §4.5.
@@ -389,6 +398,31 @@ estimate is in the control loop — the only path where SLAM error actually affe
                                           └──▶ apply, then request next tick()   (closed loop)
    time = sim clock · estimate feeds control feeds the next sensor frame
 ```
+
+Unlike the two open-loop replay paths above, live is a **closed loop**: the synchronous world advances
+one `tick()` at a time, VINS-Fusion estimates the state, the sampling MPC turns it into a
+`VehicleControl`, that control is applied, and only **then** is the world ticked on — so the estimate
+literally steers the car and SLAM error feeds back into the next sensor frame.
+
+The two rates matter for understanding the implementation: the **world ticks at 200 Hz** (Δt = 0.005 s,
+one IMU sample per tick), but the **camera fires only every 10th tick** (20 Hz). VINS produces a new
+state per camera frame and the MPC runs per control cycle, so **one full loop of the diagram = one
+20 Hz control cycle = 10 world ticks = 0.05 s** (10 IMU samples + 1 stereo frame). That is why the GIF's
+`tick` counter advances by 10 each lap while a single `frame` completes.
+
+![live closed-loop mode](figures/live_mode.gif)
+
+> Regenerate with [`python figures/make_livemode_gif.py`](figures/make_livemode_gif.py).
+
+**Stereo-only (no IMU).** The same closed loop *without* the IMU is simpler and **single-rate**: there
+is no 200 Hz inner loop, so VINS updates **once per 20 Hz stereo frame**, and metric scale comes from
+the **0.5 m baseline** via triangulation ($\text{depth} = f\,B / \text{disparity}$) rather than the IMU.
+This is the **most repeatable** variant (bit-identical run-to-run) and, on smooth CARLA driving, it
+sidesteps the IMU observability degeneracy that sinks the stereo+IMU variants (§4.6).
+
+![live stereo-only mode](figures/live_stereo.gif)
+
+> Regenerate with [`python figures/make_livemode_stereo_gif.py`](figures/make_livemode_stereo_gif.py).
 
 **Timeflow takeaway.** Online and offline **replay the same recorded data**, so offline is the
 *accuracy ceiling* (lossless + deterministic) and online is *what you'd actually get live* under
