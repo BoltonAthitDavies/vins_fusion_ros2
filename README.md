@@ -900,6 +900,40 @@ the reference loop to sub-metre accuracy (top-left, bottom-right), while the spe
   is in the VINS-local frame (≈205 m from `map`) and cannot follow the map-frame path without that
   registration.
 
+### 7.1 3D map reconstruction — VINS vs GT
+
+The other half of integration is the **map**: RTAB-Map built two 3D point clouds of the town10 loop —
+one on the **stereo VINS** odom (the run above, `3D_map/finalresult.ply`) and one on **GT** odom (a
+`drive:=coverage` sweep with `rtab_odom:=/gt_world_body/odometry`, `3D_map/gt_map.ply`). They are
+compared cloud-to-cloud with [`eval_map.py`](eval_map.py): **FPFH+RANSAC global registration → ICP**
+(to remove the VINS-world↔map frame offset), then nearest-point distances.
+
+| Metric (VINS map → GT map) | Value |
+|----------------------------|------:|
+| Mean point distance | **0.40 m** |
+| RMSE | **0.73 m** |
+| Hausdorff (p95) | 1.35 m |
+| Accuracy @0.5 m | **80.9 %** |
+| Completeness @0.5 m | **85.0 %** |
+| **F-score @0.5 m** | **82.9 %** |
+| ICP alignment fitness | 0.975 (inlier RMSE 0.46 m) |
+
+![map eval](figures/map_eval_vins_vs_gt.png)
+
+**Analysis.** After registration the VINS-built map reconstructs the GT-built map to **sub-metre**
+(0.40 m mean, 0.73 m RMSE, **83 % F-score @0.5 m**) — i.e. the map the SLAM stack produces live is
+metrically faithful to the ground-truth map, not just the trajectory. The overlay (left) shows the two
+loops coincide; the per-point heatmap (middle) is mostly < 0.5 m, with the larger errors at the loop
+extremities where stereo-VO drift accumulates before returning.
+
+Caveats: (1) **global registration is required** — the VINS map lives in the VINS-world frame, so a
+large yaw/translation offset must be removed first (centroid+ICP alone fails, fitness 0.25; FPFH+RANSAC
+recovers it, fitness 0.98). The metrics therefore measure *map shape fidelity*, not absolute placement.
+(2) **Voxel IoU @0.3 m is low (1.9 %)** and is *not* the headline — it demands exact-voxel coincidence,
+so sub-metre-but-nonzero error collapses it; the cloud-to-cloud F-score is the right metric here.
+(3) The GT map itself is RTAB on drift-free odom, so it is the fair reference for "what the same sensor
+rig would map with a perfect pose."
+
 ---
 
 ## 8. Conclusion & discussion
