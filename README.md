@@ -918,6 +918,29 @@ compared cloud-to-cloud with [`eval_map.py`](eval_map.py): **FPFH+RANSAC global 
 | **F-score @0.5 m** | **82.9 %** |
 | ICP alignment fitness | 0.975 (inlier RMSE 0.46 m) |
 
+**What each metric means.** The raw ingredient is: for every point in one cloud, the distance to the
+*nearest* point in the other. Measuring **VINS→GT** asks "is what I built correct?"; **GT→VINS** asks
+"did I capture everything?".
+
+| Metric | In plain words | How it's computed | Better |
+|--------|----------------|-------------------|:------:|
+| Mean distance | average gap between the VINS map and the real surface | mean of VINS→GT nearest distances | lower |
+| RMSE | same, but punishes big errors more (squares them) | root-mean-square of those distances | lower |
+| Hausdorff (p95) | worst-case error, ignoring the worst 5% outliers | 95th percentile of VINS→GT distances | lower |
+| Accuracy @0.5 m | of what the SLAM *drew*, how much is near real geometry (**precision**) | % of VINS points with a GT point within 0.5 m | higher |
+| Completeness @0.5 m | of the *real world*, how much the SLAM captured (**recall**) | % of GT points with a VINS point within 0.5 m | higher |
+| **F-score @0.5 m** | single balanced score of the two above (**headline**) | harmonic mean of accuracy & completeness | higher |
+| Voxel IoU @0.3 m | overlap of occupied 30 cm boxes (very strict — see caveat 2) | shared boxes ÷ total boxes | higher |
+| ICP fitness | how trustworthy the *alignment* was (a sanity check, not map quality) | % of points that found a match when aligning | higher |
+
+Reading it: distances (mean/RMSE/Hausdorff) are in metres — **lower is better**; the percentages
+(accuracy/completeness/F-score) are **higher is better**. The **0.5 m** is the "how close is close
+enough" tolerance — tighten it and the percentages drop. **Accuracy vs completeness = precision vs
+recall**: accuracy punishes wrong/extra points, completeness punishes missing coverage, and F-score
+balances them. The **mean (0.40) vs RMSE (0.73) gap** says most points are very close but a *tail* of
+larger errors exists (the red regions at the loop ends below). ICP fitness comes first: at 0.975 the
+maps were lined up well, so the rest of the numbers are real.
+
 ![map eval](figures/map_eval_vins_vs_gt.png)
 
 **Analysis.** After registration the VINS-built map reconstructs the GT-built map to **sub-metre**
@@ -926,13 +949,21 @@ metrically faithful to the ground-truth map, not just the trajectory. The overla
 loops coincide; the per-point heatmap (middle) is mostly < 0.5 m, with the larger errors at the loop
 extremities where stereo-VO drift accumulates before returning.
 
-Caveats: (1) **global registration is required** — the VINS map lives in the VINS-world frame, so a
-large yaw/translation offset must be removed first (centroid+ICP alone fails, fitness 0.25; FPFH+RANSAC
-recovers it, fitness 0.98). The metrics therefore measure *map shape fidelity*, not absolute placement.
-(2) **Voxel IoU @0.3 m is low (1.9 %)** and is *not* the headline — it demands exact-voxel coincidence,
-so sub-metre-but-nonzero error collapses it; the cloud-to-cloud F-score is the right metric here.
-(3) The GT map itself is RTAB on drift-free odom, so it is the fair reference for "what the same sensor
-rig would map with a perfect pose."
+**Caveats (in plain terms):**
+
+1. **We line the two maps up before measuring.** The VINS map is drawn in its own coordinate system —
+   shifted and rotated from the GT map — so we first slide and rotate it to sit on top of GT, then
+   measure how well they match. This means the numbers answer *"is the **shape** of the map right?"*,
+   not *"is it pinned to the exactly-right spot?"* (pinning it to the world is the GPS/registration job
+   from earlier). The simple "match the centres" line-up wasn't enough to undo the rotation (it only
+   got 25% of points to agree); a smarter feature-based line-up (FPFH+RANSAC) fixed that (98% agree).
+2. **Ignore the "Voxel IoU = 1.9%" number** — it looks alarming but isn't meaningful here. It chops
+   space into 30 cm boxes and only counts a point as "matching" if it lands in the *exact same box* as
+   GT, so even a tiny, harmless offset makes it look terrible. The **F-score** (how much of the map is
+   within half a metre of GT) is the number that actually reflects quality.
+3. **The GT map is the fair yardstick.** It was built by the **same cameras**, just given a perfect
+   position feed — so it's literally "the best map this sensor rig could make." Comparing the VINS map
+   against it tells us how much the SLAM stack's *own* position errors hurt the map.
 
 ---
 
