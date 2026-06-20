@@ -927,10 +927,10 @@ $$
 
 The ROI sent to YOLO is larger than this projected box:
 
-$$
-w_{\text{crop}} = \max(w\cdot\texttt{yolo\_roi\_scale},\;\texttt{yolo\_min\_roi\_width}),\qquad
-h_{\text{crop}} = \max(h\cdot\texttt{yolo\_roi\_scale},\;\texttt{yolo\_min\_roi\_height})
-$$
+```text
+crop_w = max(w * yolo_roi_scale, yolo_min_roi_width)
+crop_h = max(h * yolo_roi_scale, yolo_min_roi_height)
+```
 
 The final launch uses `yolo_roi_scale:=5.0`, `yolo_min_roi_width:=160`, and
 `yolo_min_roi_height:=180`; the node default is smaller (`3.5`, `100`, `120`) for debugging.
@@ -940,10 +940,9 @@ The final launch uses `yolo_roi_scale:=5.0`, `yolo_min_roi_width:=160`, and
 YOLO is **not** the state classifier. It runs inside the expanded crop and the node chooses the
 detection closest to the projected ROI center, with a confidence tie-break:
 
-$$
-\text{score} = \frac{\lVert c_{\text{yolo}} - c_{\text{proj}} \rVert}{\text{roi diagonal}}
-- 0.20\,\text{confidence}
-$$
+```text
+score = norm(c_yolo - c_proj) / roi_diagonal - 0.20 * confidence
+```
 
 The chosen YOLO box is then passed to the brightness-position classifier:
 
@@ -951,17 +950,18 @@ The chosen YOLO box is then passed to the brightness-position classifier:
 2. convert BGR to HSV and use `V` as brightness plus `S` as a saturation gate;
 3. compute a local floor and threshold:
 
-   $$
-   \text{floor}=P_{40}(V),\qquad \text{strength}=\max(V)-\text{floor},\qquad
-   \text{threshold}=\text{floor}+0.72\,\text{strength}
-   $$
+   ```text
+   floor = percentile(V, 40)
+   strength = max(V) - floor
+   threshold = floor + 0.72 * strength
+   ```
 
 4. keep lit pixels where `V >= threshold` and `S >= state_sat_min`;
 5. sum lit energy in vertical thirds:
 
-   $$
-   E = \max(V-\text{floor},0)\cdot\text{mask}
-   $$
+   ```text
+   E = max(V - floor, 0) * mask
+   ```
 
    top-third energy = red score, middle-third = yellow score, bottom-third = green score.
 
