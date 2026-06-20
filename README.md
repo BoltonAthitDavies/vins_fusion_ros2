@@ -818,85 +818,257 @@ plus an **admissible / safe-stop prune** (DWA), or an **A\* sequence search** to
 
 ## 6. Traffic-light detection
 
-> Code in [`tf_detect/`](tf_detect/). **Result:** *localization* (find the relevant light) works; camera-only
-> *state* classification (red/yellow/green) does **not** in this setup — §6.2 documents the root cause from
-> live telemetry.
+> Code in [`tf_detect_02/`](tf_detect_02/) (ROS package name: `tf_detect`). **Result:** the system can
+> choose and localize the relevant CARLA traffic light from the map + VINS pose; camera-only
+> red/yellow/green state classification is usable only in a limited range and remains the weak link.
 
-A **hybrid 3-stage** detector that locates the relevant light geometrically, confirms it with a neural
-net, then reads its state:
+The traffic-light node is a **map-guided, route-aware, two-stage perception gate** followed by a
+conservative action layer:
 
-1. **Geometric projection (where to look).** Parse the OpenDRIVE map (`Town10HD.xodr`) plus
-   `carla_light_boxes.csv` (exact lamp-head geometry dumped from CARLA actors), and project the 3D
-   light into the image using the ego odometry + camera intrinsics/extrinsics → a 2D region of
-   interest. A route-turn hint picks the relevant signal at junctions.
-2. **YOLOv11-small confirmation (is a light there).** `yolo11s.pt` (COCO class 9 = traffic light)
-   runs on the ROI to confirm and tighten the box.
-3. **State classification (what state).** Inside the confirmed box, isolate the *lit* lamp (bright **and**
-   saturated — the other two lamps are dark grey, the sky/walls are pale grey, both rejected) and decide
-   the state from the lit lamp's **vertical position** (top = red / middle = yellow / bottom = green).
-   Hue is deliberately *not* used (see §6.2). Per-frame raw decisions pass through distance/bbox-size
-   gates and a temporal majority/hold filter in the node before becoming the published state.
+1. **Route-aware geometric ROI.** Parse `Town10HD.xodr` plus `carla_light_boxes.csv`, select the
+   signal reference that matches the current planned turn, and project the selected 3D lamp head into
+   the camera image with the current odometry and camera model.
+2. **Expanded ROI + YOLO confirmation.** The projected ROI is expanded before cropping so VINS
+   localization error does not crop the light out. `yolo11s.pt` runs only on that crop (COCO class 9 =
+   traffic light) and returns a tighter traffic-light box in full-image coordinates.
+3. **Brightness-position state readout.** Inside the YOLO box, the node isolates bright **and**
+   saturated pixels in the central x-band and sums their energy in vertical thirds. Top = red, middle =
+   yellow, bottom = green. Hue is intentionally avoided because CARLA lamps render as similar amber
+   glows.
+4. **Safety gating and temporal filtering.** State is trusted only when the YOLO box is large enough
+   and the light is close enough (`min_state_bbox_height_px`, `max_state_distance_m`). Red/yellow can
+   be merged into a conservative `caution` token (`caution_stop:=true`) that publishes `red`/`stop`,
+   unknown is held briefly, and stale lights are ignored once the ego has turned off or passed them.
 
-**Topics.** Subscribes: `/carla/ego_vehicle/<cam>/image` (+ `camera_info`),
-`/vins_stereo_vel/odometry` (or `/carla/ego_vehicle/odometry`), optional `/traffic_light/route_turn`.
-Publishes: `/traffic_light/state` (`red`/`green`/`yellow`/`unknown`/`none`), `/traffic_light/action`
-(`stop`/`slow`/`go`), `/traffic_light/status` (JSON, incl. a `diag` block), optional
-`/traffic_light/debug_image`.
+**Topics.** Subscribes: `/carla/ego_vehicle/<cam>/image` plus `camera_info`,
+`/vins_stereo_vel/odometry` (or `/carla/ego_vehicle/odometry` for GT tests), and
+`/traffic_light/route_turn` when automatic route-turn bridging is enabled. Publishes:
+`/traffic_light/state` (`red`/`green`/`yellow`/`unknown`/`none`), `/traffic_light/action`
+(`stop`/`slow`/`go`), `/traffic_light/status` (JSON diagnostics), and `/traffic_light/debug_image`.
 
-Run live with `ros2 launch tf_detect traffic_light_state.launch.py`; analyse a recorded bag offline
-with `scripts/validate_projection.py` (writes an annotated video + per-frame CSV).
+Run the node alone with `ros2 launch tf_detect traffic_light_state.launch.py`, or run the normal
+integrated traffic-light stack with `ros2 launch tf_detect traffic_light_integrated.launch.py`
+(`traffic_light_state_node.py` + `route_turn_from_path.py`). Analyse bags offline with
+[`validate_projection.py`](tf_detect_02/scripts/validate_projection.py).
 
-### 6.1 Frame registration (prerequisite)
+### 6.1 Frame registration and route selection
 
-The state node needs the ego pose in the **CARLA `map`** frame to project the light, but the live MPC
-state `/vins_stereo_vel/odometry` is raw VINS `world` (origin/yaw fixed at VINS init). `map_T_world` is
-a constant SE(2), measured once by [`register_vins_to_map.py`](tf_detect/scripts/register_vins_to_map.py)
-(pairs VINS odom with GT at equal timestamps → `yaw_off = yaw_map − yaw_world`, etc.) and frozen into
-the `odom_map_*_offset` launch args. With that, the projected light box lands on the real lamp head in
-`debug_image`, so **stage 1–2 (localization + presence) work**. The failure below is purely stage 3.
+The ROI projection needs the ego pose in the **CARLA `map`** frame, but the live MPC state
+`/vins_stereo_vel/odometry` is raw VINS `world` with origin/yaw fixed at VINS initialization.
+[`register_vins_to_map.py`](tf_detect_02/scripts/register_vins_to_map.py) estimates a constant SE(2)
+registration against CARLA odometry and the launch freezes it into:
 
-### 6.2 Result & analysis — why camera-only state classification fails
+| Launch arg | Value used in the final traffic-light launch | Meaning |
+|------------|----------------------------------------------|---------|
+| `odom_map_x_offset` | `99.5` | VINS-world to CARLA-map x translation |
+| `odom_map_y_offset` | `12.076` | VINS-world to CARLA-map y translation |
+| `odom_map_z_offset` | `-0.35` in `traffic_light_state.launch.py` (`-0.45` passthrough default in the integrated launch) | vertical alignment offset |
+| `odom_map_yaw_offset_deg` | `-88.992` | VINS-world to CARLA-map yaw rotation |
+| `camera_pitch_offset_deg`, `camera_yaw_offset_deg` | `-1.0`, `1.0` | pixel-level camera projection nudges |
 
-State classification was iterated through four methods, each defeated by a property of the data:
+The route-turn bridge
+[`route_turn_from_path.py`](tf_detect_02/scripts/route_turn_from_path.py) derives
+`/traffic_light/route_turn` from the MPC target heading (`/carla/ego_vehicle/trajectory_cmd`) and the
+current VINS yaw:
 
-| Method | Idea | Why it failed |
-|--------|------|---------------|
-| HSV hue threshold | classify by colour hue | CARLA lamps all render a similar **amber/yellowish** glow; red/yellow hues overlap |
-| Brightness pop-score, fixed 3 zones | brightest third = lit lamp | bright **background** (sky behind the head) saturated all three zones |
-| Position + colour fusion | centroid position + R-vs-G dominance | red and yellow are **both** amber (R≈G); colour vote collapsed every light to "yellow" |
-| Pure position, lit-core isolation | saturation-gated lit lamp, energy per third | **YOLO bbox does not frame the 3-lamp housing** → lit lamp's position carries no state signal |
+$$
+\Delta\psi = \mathrm{wrap}(\theta_{\text{target}} - \psi_{\text{ego}})
+$$
 
-The last point is the fundamental wall, and it is visible directly in `/traffic_light/status.diag`. For a
-light that is **ground-truth RED** (top lamp), across an entire approach (≈45 m → 15 m):
+With the default hysteresis, `|Delta psi| < 10 deg` releases back to `Straight`, while crossing
+`18 deg` enters a turn:
 
-- the lit-lamp brightness **centroid `y_norm` sits at ≈ 0.44–0.48 every frame** — the *middle* of the
-  YOLO box — never near the ≈ 0.17 expected for a top lamp;
-- per-third energy `[red, yellow, green]` keeps the top (red) and middle (yellow) bins within a few
-  percent of each other (e.g. `[5230, 5306, 2861]`, `[8244, 8464, 5668]`), so the per-frame raw state
-  flickers red ↔ yellow ↔ `low_contrast` with no stable winner;
-- the lit-lamp colour is a constant `lit_rgb ≈ [250, 225, 100]` (R≈G, amber) for the whole run,
-  confirming colour cannot separate red from yellow.
+| Condition | Published turn | Selected lamp-head index |
+|-----------|----------------|--------------------------|
+| $\Delta\psi > 18^\circ$ | `Left` | `1` |
+| $\Delta\psi < -18^\circ$ | `Right` | `0` |
+| otherwise | `Straight` | `2` |
 
-**Root cause.** YOLOv11 (COCO "traffic light") returns a box whose framing of the lamp head is
-*inconsistent* — sometimes the full housing, often padded or centred on the lit lamp — so the lit lamp's
-position *within the box* is not a reliable function of the true state. Compounding it, at realistic
-approach distances the head is only **~17–45 px tall** (the three lamps ~6–15 px apart) and the lit
-lamp blooms, so even with bbox tightening the lamps are at/below the resolution needed to separate them.
-Colour offers no fallback because the rendering is amber for all three states (green is separable by
-channel dominance, but the red↔yellow pair — the safety-critical one — is not).
+The selected OpenDRIVE signal is also filtered by distance (`trigger_distance:=60` m), angle to the
+vehicle forward direction (`max_reference_angle_deg:=110`), and signal heading
+(`path_physical_signal_mode:=same-heading`, tolerance `75` deg), so the node does not blindly use every
+traffic light visible at an intersection.
 
-**Conclusion.** The failure is **data-limited, not tuning-limited**: no threshold setting recovers a
-signal the pixels do not contain at this resolution/framing. Camera-only state would require one of
-(a) a **dedicated traffic-light-state classifier** trained on CARLA crops (not COCO presence detection),
-(b) **higher-resolution / closer** capture so the three lamps are individually resolvable, or
-(c) **geometric per-lamp sampling** — projecting each lamp's known 3D position (`carla_light_boxes.csv`
-has per-head `world_center_z` + `extent_z`) and reading brightness there, which sidesteps the YOLO box
-but leaves the pure-vision regime. What *does* work and is reusable: geometric ROI selection, YOLO
-presence confirmation, frame registration, and the temporal-smoothing/action layer.
+### 6.2 Map-to-camera ROI projection
 
-**Diagnostic tooling** built to reach this conclusion (useful for any future attempt): the
-`/traffic_light/status` `diag` block (`y_norm`, `rg`, `lit_rgb`, `lit_px`, `zone_energy`), a **6× lamp
-magnifier + 3-zone overlay** drawn in `debug_image`, and the SE(2) frame calibrator above.
+For a selected traffic-light head center $P_{\text{map}}$, the projection is:
+
+$$
+P_{\text{ego}} = R_{\text{map}\to\text{ego}}^\top (P_{\text{map}} - t_{\text{map}\to\text{ego}})
+$$
+
+$$
+P_{\text{cam}} = R_{\text{ego}\to\text{cam}}^\top (P_{\text{ego}} - t_{\text{ego}\to\text{cam}})
+$$
+
+The CARLA camera axes are remapped into the pinhole optical convention used by the code:
+
+$$
+x_{\text{opt}} = Y_{\text{cam}}, \qquad y_{\text{opt}} = -Z_{\text{cam}}, \qquad
+z_{\text{opt}} = X_{\text{cam}}
+$$
+
+and the final image projection is:
+
+$$
+u = f_x \frac{x_{\text{opt}}}{z_{\text{opt}}} + c_x, \qquad
+v = f_y \frac{y_{\text{opt}}}{z_{\text{opt}}} + c_y
+$$
+
+`image_horizontal_sign:=flip` negates $x_{\text{opt}}$; without that flip the map-projected traffic
+light lands mirrored in the image. The projected lamp-head box size is depth-scaled from the CARLA
+box extents and clamped:
+
+$$
+w = \mathrm{clamp}\left(f_x\,\frac{W_{\text{physical}}}{z_{\text{opt}}}\,1.35,\;16,\;100\right),
+\qquad
+h = \mathrm{clamp}\left(f_y\,\frac{H_{\text{physical}}}{z_{\text{opt}}}\,1.35,\;24,\;140\right)
+$$
+
+The ROI sent to YOLO is larger than this projected box:
+
+$$
+w_{\text{crop}} = \max(w\cdot\texttt{yolo\_roi\_scale},\;\texttt{yolo\_min\_roi\_width}),\qquad
+h_{\text{crop}} = \max(h\cdot\texttt{yolo\_roi\_scale},\;\texttt{yolo\_min\_roi\_height})
+$$
+
+The final launch uses `yolo_roi_scale:=5.0`, `yolo_min_roi_width:=160`, and
+`yolo_min_roi_height:=180`; the node default is smaller (`3.5`, `100`, `120`) for debugging.
+
+### 6.3 YOLO confirmation and state/action policy
+
+YOLO is **not** the state classifier. It runs inside the expanded crop and the node chooses the
+detection closest to the projected ROI center, with a confidence tie-break:
+
+$$
+\text{score} = \frac{\lVert c_{\text{yolo}} - c_{\text{proj}} \rVert}{\text{roi diagonal}}
+- 0.20\,\text{confidence}
+$$
+
+The chosen YOLO box is then passed to the brightness-position classifier:
+
+1. crop the central x-band (`state_x_band_lo:=0.3`, `state_x_band_hi:=0.7`);
+2. convert BGR to HSV and use `V` as brightness plus `S` as a saturation gate;
+3. compute a local floor and threshold:
+
+   $$
+   \text{floor}=P_{40}(V),\qquad \text{strength}=\max(V)-\text{floor},\qquad
+   \text{threshold}=\text{floor}+0.72\,\text{strength}
+   $$
+
+4. keep lit pixels where `V >= threshold` and `S >= state_sat_min`;
+5. sum lit energy in vertical thirds:
+
+   $$
+   E = \max(V-\text{floor},0)\cdot\text{mask}
+   $$
+
+   top-third energy = red score, middle-third = yellow score, bottom-third = green score.
+
+If the winning score is not at least `state_score_ratio:=1.15` times the second score, the raw state is
+`unknown` (`low_contrast`). The node also gates state confidence with:
+
+| Gate | Default in launch | Effect |
+|------|-------------------|--------|
+| `min_state_bbox_height_px` | `13.5` px | smaller YOLO boxes cannot be read reliably |
+| `max_state_distance_m` | `40.0` m | beyond this range the state is forced to `unknown` |
+| `state_confirm_frames` | `3` | token must persist before the smoothed state changes |
+| `unknown_hold_seconds` | `0.9` s | short unknown gaps hold the last confirmed token |
+| `caution_stop` | `true` | red/yellow collapse to `caution` and publish `stop` |
+
+Action mapping after smoothing:
+
+| State token | Published state | Action |
+|-------------|-----------------|--------|
+| `green` | `green` | `go` |
+| `yellow` | `yellow` | `slow` |
+| `red` | `red` | `stop` |
+| `caution` | `red` | `stop` |
+| `unknown` | `unknown` | `slow` |
+| `none` | `none` | `go` |
+
+`tf_detect_02` also adds stateless "stop obeying this light" checks so a turn light is ignored after
+the car has committed through the junction:
+
+| Ignore reason | Condition |
+|---------------|-----------|
+| `turned_off_lane` | heading error from the signal heading exceeds `ignore_turn_heading_deg:=40` |
+| `near_light` | distance to the light head is less than `ignore_near_distance_m:=5` in launch |
+| `passed_light` | abeam angle from ego forward to light head exceeds `ignore_abeam_angle_deg:=85` |
+
+The diagnostic JSON on `/traffic_light/status` includes `signal_id`, `roi_signal_id`, `turn_relation`,
+`distance_m`, `proj_box`, `yolo_box`, `bbox_height_px`, `raw_state`, smoothed `state`, `action`,
+`ignore_reason`, and `diag` (`y_norm`, `rg`, `lit_rgb`, `lit_px`, `zone_energy`, ...).
+
+### 6.4 Results and analysis
+
+**Exp. A — VINS odometry effect on projection, no YOLO reference.** The same selected traffic-light
+box is projected with CARLA GT odometry and with VINS odometry. The metric is the pixel shift between
+the two projected ROI centers:
+
+$$
+e_{\text{center}} =
+\sqrt{(u_{\text{vins}}-u_{\text{gt}})^2 + (v_{\text{vins}}-v_{\text{gt}})^2}
+$$
+
+and IoU is computed directly between the two projected boxes (not against YOLO).
+
+| Metric | Value |
+|--------|------:|
+| evaluated frames | 870 |
+| mean center shift | 9.65 px |
+| median center shift | 6.41 px |
+| RMS center shift | 11.78 px |
+| P90 center shift | 20.55 px |
+| mean normalized shift (`center_shift / h_gt`) | 0.320 |
+| mean projection IoU | 0.428 |
+| mean vertical IoU | 0.660 |
+
+This is why the live node expands the projected ROI before YOLO: the VINS projection is close enough to
+guide the crop, but not reliable enough to use as a tight box.
+
+**Exp. B — state readout.** The useful state-estimation range in the collected bag is about
+**20-40 m**:
+
+| Distance to light | State accuracy | Unknown rate | Mean YOLO box height |
+|-------------------|---------------:|-------------:|---------------------:|
+| 0-20 m | 15.8% | 52.6% | 36.1 px |
+| 20-30 m | 80.5% | 13.7% | 22.7 px |
+| 30-40 m | 88.1% | 10.0% | 18.6 px |
+| 40-60 m | 0.0% | 100.0% | 14.0 px |
+| 60-100 m | 0.0% | 100.0% | 8.8 px |
+
+The classifier is intentionally conservative beyond 40 m (`too_far`) and with small boxes
+(`bbox_too_small`). Within the usable band the raw-state confusion still shows the data limitation:
+
+| Ground truth | Correct | Unknown | Main failure |
+|--------------|--------:|--------:|--------------|
+| red | 61.7% | 36.4% | red often becomes `unknown` |
+| green | 70.2% | 19.0% | green sometimes becomes yellow/unknown |
+
+The root cause is that YOLOv11 (trained as a COCO traffic-light *presence* detector) does not
+consistently frame the full 3-lamp housing. Quantitatively:
+
+| Evidence | Value | Interpretation |
+|----------|------:|----------------|
+| YOLO height / projected height | 0.607 mean | YOLO often frames less than the full housing |
+| full box IoU (`proj_box` vs `yolo_box`) | 0.153 mean | map housing box and YOLO visual box overlap weakly |
+| vertical IoU | 0.428 mean | vertical position in the YOLO box is not stable |
+| GT-red lit centroid `y_norm` | 0.342 mean | should be near 0.17 for a top lamp |
+| GT-green lit centroid `y_norm` | 0.614 mean | should be near 0.83 for a bottom lamp |
+| bbox height at 30-40 m | 18.6 px mean | each of 3 vertical zones is only about 6 px |
+| bbox height at 60-100 m | 8.8 px mean | too small to resolve three lamps |
+
+Colour is also not a robust fallback. The diagnostic `rg=(R-G)/(R+G+1)` gives mean `0.074` for GT-red
+and `0.006` for GT-green in the bag; red/yellow/green are rendered with a similar amber glow, so hue
+thresholding alone cannot solve the problem. The failure is therefore **data-limited, not just
+threshold-limited**.
+
+Practical conclusion: keep the reusable parts (map-guided ROI, route-turn signal selection, YOLO
+presence confirmation, temporal/action gating), but treat camera-only colour/state as a limited
+prototype. A production version should either train a dedicated CARLA traffic-light-state classifier,
+use higher-resolution/closer crops, or project known per-lamp geometry and sample brightness at each
+lamp head directly.
 
 ---
 
@@ -1143,7 +1315,20 @@ rtabmap-databaseViewer ~/rtab_carla_live.db          # Edit → View 3D Map…
 ### Traffic-light detection
 
 ```bash
+# stand-alone state node (manual/externally supplied route_turn)
 ros2 launch tf_detect traffic_light_state.launch.py
-# offline validation over a recorded bag:
-python3 src/tf_detect/scripts/validate_projection.py --bag <rosbag>.db3 --map Town10HD.xodr
+
+# normal integrated traffic-light stack: state node + route-turn bridge from MPC target
+ros2 launch tf_detect traffic_light_integrated.launch.py
+
+# offline projection/YOLO/state validation over a recorded bag:
+python3 src/tf_detect_02/scripts/validate_projection.py \
+  --bag <rosbag>.db3 \
+  --map src/Town10HD.xodr \
+  --objects src/tf_detect_02/scripts/objects.json \
+  --traffic-light-boxes src/carla_light_boxes.csv \
+  --camera-id cam_front_right \
+  --candidate-mode path \
+  --path-physical-signal-mode same-heading \
+  --image-horizontal-sign flip
 ```
