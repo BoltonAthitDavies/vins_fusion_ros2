@@ -435,14 +435,24 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 | stereo+gps | 10.8 / 17.1 | **0.25 / 0.02** |
 | **stereo+imu+gps** | 1.5 / 2.6 | **0.20 / 0.00** |
 
-**`town10_normal`** — normal-speed loop (APE RMSE [m]):
+**`town10_normal`** — normal-speed loop (APE RMSE [m] / 5-run spread [m]; live = RMSE only †):
 
 | Variant | online | offline | live |
 |---------|:------:|:------:|:----:|
-| stereo | 34.1 | **6.4** | **0.6** |
-| stereo+imu | 1388 | **1423** | **DIV** |
-| stereo+gps | 2.6 | **0.26** | **0.3** |
-| stereo+imu+gps | 173.6 | **22.3** | **DIV** |
+| stereo | 45.4 / 0.00 | **6.4 / 0.20** | **0.6** |
+| stereo+imu | 1255 / 0.02 | **1161 / 1406** | **DIV** |
+| stereo+gps | 2.2 / 1.38 | **0.26 / 0.01** | **0.3** |
+| stereo+imu+gps | 136 / 651 | **20.7 / 34.5** | **DIV** |
+
+Online = `output_rosbag/town10_normal`, offline = `output_direct_xyyaw/town10_normal` (RMSE and spread
+both recomputed from these so each cell is one consistent source); live = `logs/run{1..5}.csv`.
+
+† **Live spread is omitted** because the 5 live runs are *independent drives* (each with its own GT),
+so a same-input determinism spread isn't defined; live run-to-run consistency is covered in the live
+figures/caption below. Online/offline replay the *same* bag, so their spread **is** a true determinism
+measure: offline is near-deterministic (~0.01–0.2 m for bounded variants); the large spreads are the
+diverged IMU variants (divergence amplifies tiny differences). Online stereo is also deterministic
+(0.00) — its high RMSE is timing-induced frame loss, not non-determinism.
 
 **`town10_alwaysrun`** — continuous, varied motion (APE RMSE [m] / spread [m]):
 
@@ -471,7 +481,7 @@ logs the quaternion (§[Commands](#9-commands)):
 | stereo+gps | **0.6°** | **94.3°** ‡ | **77.2°** ‡ |
 | stereo+imu+gps | 4.6° | 71.6° | 34.9° ‡ |
 
-† diverged in position (1423 m), so heading is meaningless too.
+† diverged in position (~1160 m), so heading is meaningless too.
 ‡ **`global_fusion` heading is unreliable on the town10 loop**: GPS pins *position* (sub-metre) but
 heading is only weakly observable from position alone, so the GPS variants show sub-metre position
 with **erratic orientation** on town10 (yaw sweeps ~630° vs GT's 360°) — while on the town01 route the
