@@ -288,6 +288,21 @@ void CarlaWorld::setCoverageMode(bool enabled) {
          "ignore lights+signs, %zu traffic lights re-phased\n", tls.size());
 }
 
+std::vector<CarlaWorld::TrafficLightState> CarlaWorld::getTrafficLightStates() const {
+  std::vector<TrafficLightState> out;
+  if (!p_->world) return out;
+  auto lights = p_->world->GetActors()->Filter("*traffic_light*");
+  for (auto a : *lights) {
+    auto tl = boost::static_pointer_cast<cc::TrafficLight>(a);
+    TrafficLightState s;
+    s.actor_id = tl->GetId();
+    s.opendrive_id = std::string(tl->GetOpenDRIVEID());
+    s.state = static_cast<int>(tl->GetState());
+    out.push_back(std::move(s));
+  }
+  return out;
+}
+
 void CarlaWorld::shutdown() {
   if (!p_->world) return;
   for (auto *s : {&p_->cam_left, &p_->cam_right, &p_->imu, &p_->gnss}) {

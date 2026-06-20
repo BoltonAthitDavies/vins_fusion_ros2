@@ -10,9 +10,10 @@ components:
 3. **Perception** — a **traffic-light detector** (`src/tf_detect`) that turns the front camera into a
    stop / slow / go action.
 
-> **Status.** SLAM is fully evaluated (online vs offline vs live, 4 variants × 5 runs × 3 scenes).
-> The MPC and traffic-light detector are implemented and run live; their standalone experiments and
-> the full closed-loop integration are **not yet evaluated** and are marked *"to be added"* below.
+> **Status.** SLAM is fully evaluated (online vs offline vs live, 4 variants × 5 runs × 3 scenes); the
+> **MPC is tuned** (horizon & lookahead sweeps, §5.1); the **traffic-light** localization-vs-state
+> behavior is characterized (§6.2); and the **full closed loop runs end-to-end** (§7) — stereo VINS →
+> MPC → traffic-light gate, a 439 m lap at 0.81 m cross-track with brake-to-hold stops at red lights.
 
 ---
 
@@ -22,7 +23,7 @@ components:
 2. [Environment setup](#2-environment-setup)
 3. [Ego vehicle](#3-ego-vehicle-kinematics-state-input-sensors)
 4. [SLAM (VINS-Fusion): equations, config rationale, online/offline/live setup, results, analysis](#4-slam-vins-fusion)
-5. [MPC: equations & method](#5-mpc-model-predictive-control)
+5. [MPC: equations, method, & tuning experiment](#5-mpc-model-predictive-control)
 6. [Traffic-light detection](#6-traffic-light-detection)
 7. [Integration (SLAM + MPC + traffic light)](#7-integration)
 8. [Conclusion & discussion](#8-conclusion--discussion)
@@ -72,7 +73,7 @@ tracks a reference path, and gates throttle/brake on a camera-based traffic-ligh
 | Map | `Town10HD` (primary), `Town01` |
 | Ego | `vehicle.tesla.model3` |
 | Optimizer | **Ceres 2.2** (Manifold API) |
-| Vision | **OpenCV 4.10 + CUDA** built in `~/local` (GPU feature tracking) |
+| Vision | **OpenCV 4.10 + CUDA** built in `~/local` (GPU *available*, but runs **CPU by default** — `use_gpu: 0`) |
 | 3D mapping | apt **`rtabmap_ros`** (run under a clean `LD_LIBRARY_PATH` to avoid an ABI clash with `~/local`) |
 | Packages | `vins_fusion_ros2`, `global_fusion`, `tf_detect` |
 
@@ -183,6 +184,13 @@ $$
 
 VINS-Fusion is a **tightly-coupled, optimization-based** estimator: pose estimation = minimizing a
 sum of Mahalanobis residuals over a sliding window of recent keyframes (it is **not** a filter).
+
+**Pipeline.** The **front end** tracks point features by KLT optical flow (`max_cnt: 150` features,
+`min_dist: 30` px spacing, `flow_back: 1` = forward-backward consistency check). The **back end** runs
+a sliding-window **bundle adjustment** over the most recent keyframes (10 in VINS-Fusion) with Ceres;
+when a keyframe leaves the window it is **marginalized** into the prior $r_p$ so old information is
+kept without unbounded growth. GPS, when enabled, is a **separate** pose-graph stage (`global_fusion`,
+below). The state, cost, and residuals that follow describe that back-end optimization.
 
 **State** — sliding window of $n{+}1$ keyframes and $m$ features. Each keyframe state $x_k$ holds
 position, velocity, orientation, accelerometer bias and gyro bias; $x_c$ is the camera↔IMU extrinsic;
@@ -339,6 +347,26 @@ Four estimator variants, each run **5 times** per scene, across **three data pat
 Ground truth = CARLA `/carla/ego_vehicle/odometry`. Metrics = **APE RMSE** (Umeyama-aligned absolute
 trajectory error) and **5-run spread** (run-to-run determinism); `DIV` = diverged (> 10⁴ m).
 
+**The three scenes** (each a CARLA-autopilot drive, recorded once then replayed/observed through all
+three paths):
+
+| Scene | Map | Source bag | Duration | Route | Character |
+|-------|-----|------------|:--------:|-------|-----------|
+| `town01_normal` | Town01 | `town01_drivenormal` | 39.5 s | ~190 m segment, ~5 m/s | easy, well-conditioned baseline |
+| `town10_normal` | Town10HD | `noimunoise` | 114.7 s | **~442 m loop**, ~5.4 m/s | normal-speed urban loop — **smooth** (the degenerate motion) |
+| `town10_alwaysrun` | Town10HD | `alwaysdrive` | 110.4 s | ~442 m loop, continuous | **never stops** — varied accel/braking/turning |
+
+The town10 loop is ~442 m (measured from GT). The only difference between the two town10 scenes is the
+**motion profile** — `alwaysrun` keeps the car continuously maneuvering, which is exactly what makes
+the IMU observable there but not on the smooth `normal` drive (§4.6). For the **live** town10 runs the
+car is driven on GT around the same loop (~82 s, mean 5.4 m/s) while the four VINS variants observe
+passively.
+
+> **Initialization note.** VINS-Fusion needs a **moving** start: visual-inertial init must observe
+> scale and biases from parallax + IMU excitation, so a *stationary* start initializes, immediately
+> NaNs, and re-initializes in a loop (observed 54× on a still-start bag). Every dataset here starts in
+> motion — the always-moving bags give a clean 1 init, 0 re-inits.
+
 ### 4.4 Online vs offline vs live — setup, data flow, timeflow
 
 The **same VINS code** runs in all three. What differs is *how* the stereo/IMU/GPS streams reach it
@@ -350,7 +378,7 @@ and *which clock* drives time — and that alone changes determinism, speed, and
 | Clock (time base) | wall-clock × rate, via `/clock` | message `header.stamp` | CARLA sim tick |
 | Delivery | async DDS pub/sub (**lossy**) | synchronous, in-order (**lossless**) | synchronous sensor callbacks |
 | Speed | real-time (1×) | **~10× faster** | real-time |
-| Determinism | **no** (timing-dependent) | **yes** (bit-identical) | yes (after camera-swap + rate fix) |
+| Determinism | **no** (timing-dependent) | **yes**, config-dependent (bit-identical single-thread; ~0.3 m multi-thread) | yes (after camera-swap + rate fix) |
 | What it means | what you'd get live | best-case accuracy ceiling | the real closed-loop system |
 
 The two **replay** paths (online vs offline) feed the *same recorded data* to the *same VINS* — the only
@@ -376,12 +404,13 @@ non-determinism seen in §4.5.
 
 **Offline** — `vins_bag_reader` opens the bag with `rosbag2_cpp::SequentialReader` and feeds **every**
 message straight into VINS in `header.stamp` order. Nothing is dropped, time comes from the stamps,
-and with the RANSAC RNG seeded the result is **bit-identical** every run and ~10× faster than playback.
+and with single-thread + seeded RANSAC the result is **bit-identical** every run (multi-threaded it is
+*near*-deterministic, ~0.3 m); either way ~10× faster than playback.
 
 ```
  rosbag ──SequentialReader (direct read)──▶ messages in header.stamp order
                                             └─ hand EACH frame directly into VINS ─▶ CSV
-   time = header.stamp · no DDS · no drops · seeded RANSAC ⇒ bit-identical, ~10× real-time
+   time = header.stamp · no DDS · no drops · seeded RANSAC ⇒ reproducible (bit-identical single-thread), ~10× real-time
 ```
 
 **Live** — the native CARLA C++ node runs the simulator in **synchronous mode**: each `tick()`
@@ -435,28 +464,70 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 
 | Variant | online | offline |
 |---------|:------:|:------:|
-| stereo | 20.6 / 0.000 | 20.6 / 0.000 |
-| stereo+imu | 22.8 / 7.2 | 80.1 / 0.000 |
-| stereo+gps | 10.8 / 17.1 | 1.3 / 0.000 |
-| **stereo+imu+gps** | 1.5 / 2.6 | **0.5 / 0.000** |
+| stereo | 20.6 / 0.000 | **0.48 / 0.42** |
+| stereo+imu | 22.8 / 7.2 | **11.0 / 7.95** |
+| stereo+gps | 10.8 / 17.1 | **0.25 / 0.02** |
+| **stereo+imu+gps** | 1.5 / 2.6 | **0.20 / 0.00** |
 
-**`town10_normal`** — normal-speed loop (APE RMSE [m]):
+**`town10_normal`** — normal-speed loop (APE RMSE [m] / 5-run spread [m]; live = RMSE only †):
 
 | Variant | online | offline | live |
 |---------|:------:|:------:|:----:|
-| stereo | 34.1 | 6.4 | **0.6** |
-| stereo+imu | 1388 | 2182 | **DIV** |
-| stereo+gps | 2.6 | 0.3 | **0.3** |
-| stereo+imu+gps | 173.6 | 121.4 | **DIV** |
+| stereo | 45.4 / 0.00 | **6.4 / 0.20** | **0.6** |
+| stereo+imu | 1255 / 0.02 | **1161 / 1406** | **DIV** |
+| stereo+gps | 2.2 / 1.38 | **0.26 / 0.01** | **0.3** |
+| stereo+imu+gps | 136 / 651 | **20.7 / 34.5** | **DIV** |
+
+Online = `output_rosbag/town10_normal`, offline = `output_direct_xyyaw/town10_normal` (RMSE and spread
+both recomputed from these so each cell is one consistent source); live = `logs/run{1..5}.csv`.
+
+† **Live spread is omitted** because the 5 live runs are *independent drives* (each with its own GT),
+so a same-input determinism spread isn't defined; live run-to-run consistency is covered in the live
+figures/caption below. Online/offline replay the *same* bag, so their spread **is** a true determinism
+measure: offline is near-deterministic (~0.01–0.2 m for bounded variants); the large spreads are the
+diverged IMU variants (divergence amplifies tiny differences). Online stereo is also deterministic
+(0.00) — its high RMSE is timing-induced frame loss, not non-determinism.
 
 **`town10_alwaysrun`** — continuous, varied motion (APE RMSE [m] / spread [m]):
 
 | Variant | online | offline |
 |---------|:------:|:------:|
-| stereo | DIV / — | 9.3 / 16.1 |
-| stereo+imu | 920 / 3.3 | 27.2 / 165 |
-| stereo+gps | DIV / — | 0.5 / 1.19 |
-| **stereo+imu+gps** | 171.9 / 593 | **0.3 / 0.24** |
+| stereo | DIV / — | **12.8 / 0.33** |
+| stereo+imu | 920 / 3.3 | **5.0 / 2.36** |
+| stereo+gps | DIV / — | **0.35 / 0.00** |
+| **stereo+imu+gps** | 171.9 / 593 | **0.25 / 0.00** |
+
+> **Caveats on the tables.** (1) The **offline** columns are the **latest re-collection** (current
+> config, with orientation logged — see the yaw table below); the **online** columns are older and
+> read worse, so online-vs-offline is **not** strictly like-for-like (especially the town10 online
+> columns, still pre-winner config). (2) **Determinism:** this offline collection is **not**
+> bit-identical (spreads ~0.2–0.4 m for bounded variants, not 0.000) — it was run with
+> `multiple_thread: 1`; the earlier bit-identical result used single-thread + seeded RANSAC.
+
+**Direct-mode heading error** (yaw RMSE, deg; frame-independent — best constant yaw offset removed,
+the rotational analog of the Umeyama position alignment). Now available because the offline writer
+logs the quaternion (§[Commands](#9-commands)):
+
+| Variant | town01_normal | town10_normal | town10_alwaysrun |
+|---------|:-------------:|:-------------:|:----------------:|
+| stereo | **0.2°** | **1.9°** | 6.5° |
+| stereo+imu | 4.1° | 67.7° † | 2.6° |
+| stereo+gps | **0.6°** | **94.3°** ‡ | **77.2°** ‡ |
+| stereo+imu+gps | 4.6° | 71.6° | 34.9° ‡ |
+
+† diverged in position (~1160 m), so heading is meaningless too.
+‡ **`global_fusion` heading is unreliable on the town10 loop**: GPS pins *position* (sub-metre) but
+heading is only weakly observable from position alone, so the GPS variants show sub-metre position
+with **erratic orientation** on town10 (yaw sweeps ~630° vs GT's 360°) — while on the town01 route the
+same pipeline is fine (0.6°). A real loosely-coupled-fusion property, not a metric artifact.
+
+Aligned **x, y, and heading-error vs GT over time** (run1; flat = perfect). On town10_normal,
+`stereo+gps` (green) sits on GT in x/y yet its yaw error swings to ±150° — the finding above made
+visual; town01 stays flat in all three:
+
+| town01_normal | town10_normal | town10_alwaysrun |
+|---|---|---|
+| ![xyyaw town01](figures/xyyaw_town01_normal.png) | ![xyyaw town10_normal](figures/xyyaw_town10_normal.png) | ![xyyaw town10_alwaysrun](figures/xyyaw_town10_alwaysrun.png) |
 
 | Live tracking (town10_normal) | Divergence onset (town10_normal) |
 |---|---|
@@ -470,8 +541,10 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
 
 1. **GPS is the single biggest accuracy win.** On every normal-speed scene the GPS variants are the
    most accurate (sub-metre offline/live), and they stay bounded where pure VO/VIO diverges.
-2. **Pure stereo is the most *repeatable*** (bit-identical across 5 runs offline) but **never the most
-   accurate**, and it can diverge on low-excitation motion.
+2. **Pure stereo is the most *repeatable*** (smallest run-to-run spread) but **never the most
+   accurate**, and it can diverge on low-excitation motion. (Determinism is **config-dependent**: with
+   single-thread + seeded RANSAC the offline runs were bit-identical; the latest `multiple_thread: 1`
+   collection is *near*-deterministic — ~0.2–0.4 m spread — not bit-identical.)
 3. **The IMU paths diverge on smooth, normal driving** — and this is a **fundamental visual-inertial
    observability degeneracy**, not a tuning bug. CARLA's smooth, planar, low-rotation motion leaves
    the IMU-coupled states (velocity, accel/gyro bias, gravity) unobservable. This is corroborated
@@ -489,16 +562,27 @@ IMU variants) is conclusive about the SLAM, not an artifact of dropped frames or
    deterministic** in real time (0.6 m and 0.3 m). Both IMU variants diverge on **all 5** live runs —
    which rules out a control/timing artifact and points squarely at the degeneracy above.
 5. The estimator itself is deterministic; non-determinism only appears in `global_fusion` when it is
-   fed a marginal/diverged estimate. Real-time performance: ~3.3 ms/frame on CPU (backlog 0).
+   fed a marginal/diverged estimate. Real-time performance: **~3.3 ms/frame on CPU** (backlog 0) — and
+   note the front end runs **CPU**, not GPU: the CUDA path measured *slower* (~5 ms) at this
+   resolution/feature budget, so `use_gpu: 0` is the deliberate default.
 
    ![perf](figures/perf_ab.png)
+
+6. **Good position ≠ good heading for the GPS variants.** Now that offline logs orientation, the yaw
+   table shows `global_fusion` delivers sub-metre *position* but **unreliable heading on the town10
+   loop** (~77–94° yaw RMSE) — GPS constrains position, not heading, so in a loosely-coupled pose
+   graph the global yaw is weakly observable. Pure stereo/VIO keep heading well where position holds
+   (town01 ≤ 0.2°), and on town01 the GPS heading is also fine (0.6°); it is specifically the town10
+   route that breaks the fused heading. **Takeaway:** if a downstream consumer needs heading (e.g. the
+   MPC), prefer the raw VIO orientation over the GPS-fused one.
 
 ---
 
 ## 5. MPC (Model-Predictive Control)
 
-> *Experiment / result / analysis: **to be added.*** This section documents the method + equations as
-> implemented in [`mpc.hpp`](src/carla_cpp/mpc.hpp).
+> This section documents the method + equations as implemented in
+> [`mpc.hpp`](src/carla_cpp/mpc.hpp); the **tuning experiment** (horizon & lookahead sweeps, with
+> tracking + controller-behavior results) is in [§5.1](#51-experiment--horizon-and-lookahead-tuning) below.
 
 A **sampling (brute-force) MPC**. Each control cycle it rolls a kinematic bicycle model forward over
 the horizon for a small grid of candidate `(steer, accel)` pairs, scores each rollout, and applies the
@@ -594,6 +678,71 @@ over. Two helpers make a VINS estimate usable as the MPC state:
 Drive modes (`drive:=`): `coverage` (Traffic-Manager loop route, ignores lights — for map coverage),
 `autopilot` (plain Traffic Manager), `trajectory` (MPC follows `/carla/ego_vehicle/trajectory_cmd`).
 
+### 5.1 Experiment — horizon and lookahead tuning
+
+**Setup.** The MPC drives the ego around the recorded **town10 loop** (442 m), following the reference
+path published by `play_gt_path.py` while `mpc_debug_log.py` records GT pose, the control commands, and
+speed at 20 Hz. Two one-axis sweeps (the two parameters are coupled — see the related-work note and
+the rule below), each scored against the reference loop:
+- **Horizon** $H \in \{1, 15, 50, 100\}$ steps at fixed lookahead $L_d = 6$ m.
+- **Lookahead** $L_d \in \{1, 2, 6, 12\}$ m at fixed horizon $H = 15$.
+
+Metrics: **completed** = drove the full lap (GT distance ≈ 442 m *and* ended < 10 m from the route
+end); **x-track RMSE/max** = perpendicular deviation from the reference path; **steer std** = control
+activity (chatter). Figures generated by [`generate_mpc_figs.py`](generate_mpc_figs.py).
+
+**Horizon sweep** ($L_d = 6$ m) — *only* $H=15$ completes:
+
+| $H$ | completed | GT dist | end→route-end | x-track RMSE | x-track max | mean speed | steer std |
+|----:|:---------:|--------:|--------------:|-------------:|------------:|-----------:|----------:|
+| 1 | ✗ | 125.6 m | 72.5 m | 0.93 m | 1.53 m | 3.42 m/s | **0.187** (chatter) |
+| **15** | ✅ | **436.5 m** | **2.9 m** | 1.51 m | 3.87 m | 4.91 m/s | 0.082 |
+| 50 | ✗ | 212.2 m | 114.7 m | 3.16 m | 7.12 m | 3.85 m/s | 0.069 |
+| 100 | ✗ | 134.3 m | 84.5 m | 9.17 m | 11.97 m | **1.47** (crawl) | 0.135 |
+
+**Lookahead sweep** ($H = 15$) — all complete; tracking is tightest at $L_d = 2$ m:
+
+| $L_d$ | completed | GT dist | end→route-end | x-track RMSE | x-track max | mean speed |
+|------:|:---------:|--------:|--------------:|-------------:|------------:|-----------:|
+| 1 m | ✅ | 435.0 m | 0.8 m | 0.78 m | 1.96 m | 4.99 m/s |
+| **2 m** | ✅ | 434.6 m | 0.6 m | **0.67 m** | 2.04 m | 5.05 m/s |
+| 6 m | ✅ | 436.5 m | 2.9 m | 1.51 m | 3.87 m | 4.91 m/s |
+| 12 m | ✅ | 435.3 m | 1.5 m | 1.01 m | 2.00 m | 5.15 m/s |
+
+**Horizon sweep** — per-config trajectory (each config its own panel), then $x/y/\text{yaw}$ vs time,
+then controller behavior:
+
+![horizon xy](figures/mpc_horizon_xy.png)
+
+![horizon xyyaw](figures/mpc_horizon_xyyaw.png)
+
+![horizon behavior](figures/mpc_horizon_behavior.png)
+
+**Lookahead sweep** — same three views:
+
+![lookahead xy](figures/mpc_lookahead_xy.png)
+
+![lookahead xyyaw](figures/mpc_lookahead_xyyaw.png)
+
+![lookahead behavior](figures/mpc_lookahead_behavior.png)
+
+**Findings.**
+1. **Horizon is the *completion* knob.** Only $H=15$ drives the full lap. $H=1$ is myopic and
+   **chatters** (steer std 0.187, the visible ±0.5 oscillation in the behavior plot) → stalls early;
+   $H=50/100$ overshoot the close target and **crawl/stall** ($H=100$ averages 1.47 m/s and covers only
+   134 m in the same 91 s that $H=15$ uses to finish). This is the rollout-distance rule:
+   $H\,dt\,v_c \gtrsim L_d$ ($H=15 \to 8.3$ m $\gtrsim 6$ m); too short can't reach the target, too long
+   overshoots it.
+2. **Lookahead is the *accuracy* knob.** With $H=15$ every lookahead completes, but tracking is
+   **tightest at $L_d = 2$ m (0.67 m RMSE)** and degrades as $L_d$ grows by **corner-cutting**
+   (6 m → 1.51 m, 12 m → 1.01 m). $L_d=1$ m starts to show slight steer saturation. On this low-speed
+   (5.5 m/s), tight urban loop a *short* lookahead hugs the path better — which **revises the
+   pure-pursuit time-headway guess of ~6 m**; the geometry rule sets the *upper* bound (corner-cut
+   $\approx L_d^2/8R$), and the empirics land below it.
+3. **Best config: $H = 15$, $L_d \approx 2$ m** — full lap, 0.67 m RMSE, smooth steering. $L_d = 6$ m
+   also completes and is smoother through corners (a tracking-vs-smoothness trade), which is why the
+   default run recipe uses 6 m.
+
 ### Configuration (parameters & defaults)
 
 All MPC parameters are hardcoded defaults in [`mpc.hpp`](src/carla_cpp/mpc.hpp); only `horizon` and
@@ -669,10 +818,12 @@ plus an **admissible / safe-stop prune** (DWA), or an **A\* sequence search** to
 
 ## 6. Traffic-light detection
 
-> *Experiment / result / analysis: **to be added.*** Code in [`tf_detect/`](tf_detect/).
+> Code in [`tf_detect/`](tf_detect/). **Result:** *localization* (find the relevant light) works; camera-only
+> *state* classification (red/yellow/green) does **not** in this setup — §6.2 documents the root cause from
+> live telemetry.
 
 A **hybrid 3-stage** detector that locates the relevant light geometrically, confirms it with a neural
-net, then reads its color:
+net, then reads its state:
 
 1. **Geometric projection (where to look).** Parse the OpenDRIVE map (`Town10HD.xodr`) plus
    `carla_light_boxes.csv` (exact lamp-head geometry dumped from CARLA actors), and project the 3D
@@ -680,28 +831,173 @@ net, then reads its color:
    interest. A route-turn hint picks the relevant signal at junctions.
 2. **YOLOv11-small confirmation (is a light there).** `yolo11s.pt` (COCO class 9 = traffic light)
    runs on the ROI to confirm and tighten the box.
-3. **HSV color classification (what state).** The confirmed box is split into vertical thirds
-   (top = red, middle = yellow, bottom = green); the active-pixel (high saturation/value) vertical
-   position gives the state plus a confidence score.
+3. **State classification (what state).** Inside the confirmed box, isolate the *lit* lamp (bright **and**
+   saturated — the other two lamps are dark grey, the sky/walls are pale grey, both rejected) and decide
+   the state from the lit lamp's **vertical position** (top = red / middle = yellow / bottom = green).
+   Hue is deliberately *not* used (see §6.2). Per-frame raw decisions pass through distance/bbox-size
+   gates and a temporal majority/hold filter in the node before becoming the published state.
 
 **Topics.** Subscribes: `/carla/ego_vehicle/<cam>/image` (+ `camera_info`),
-`/carla/ego_vehicle/odometry`, optional `/traffic_light/route_turn`. Publishes:
-`/traffic_light/state` (`red`/`green`/`yellow`/`unknown`/`none`), `/traffic_light/action`
-(`stop`/`slow`/`go`), `/traffic_light/status` (JSON detail), optional `/traffic_light/debug_image`.
+`/vins_stereo_vel/odometry` (or `/carla/ego_vehicle/odometry`), optional `/traffic_light/route_turn`.
+Publishes: `/traffic_light/state` (`red`/`green`/`yellow`/`unknown`/`none`), `/traffic_light/action`
+(`stop`/`slow`/`go`), `/traffic_light/status` (JSON, incl. a `diag` block), optional
+`/traffic_light/debug_image`.
 
 Run live with `ros2 launch tf_detect traffic_light_state.launch.py`; analyse a recorded bag offline
 with `scripts/validate_projection.py` (writes an annotated video + per-frame CSV).
+
+### 6.1 Frame registration (prerequisite)
+
+The state node needs the ego pose in the **CARLA `map`** frame to project the light, but the live MPC
+state `/vins_stereo_vel/odometry` is raw VINS `world` (origin/yaw fixed at VINS init). `map_T_world` is
+a constant SE(2), measured once by [`register_vins_to_map.py`](tf_detect/scripts/register_vins_to_map.py)
+(pairs VINS odom with GT at equal timestamps → `yaw_off = yaw_map − yaw_world`, etc.) and frozen into
+the `odom_map_*_offset` launch args. With that, the projected light box lands on the real lamp head in
+`debug_image`, so **stage 1–2 (localization + presence) work**. The failure below is purely stage 3.
+
+### 6.2 Result & analysis — why camera-only state classification fails
+
+State classification was iterated through four methods, each defeated by a property of the data:
+
+| Method | Idea | Why it failed |
+|--------|------|---------------|
+| HSV hue threshold | classify by colour hue | CARLA lamps all render a similar **amber/yellowish** glow; red/yellow hues overlap |
+| Brightness pop-score, fixed 3 zones | brightest third = lit lamp | bright **background** (sky behind the head) saturated all three zones |
+| Position + colour fusion | centroid position + R-vs-G dominance | red and yellow are **both** amber (R≈G); colour vote collapsed every light to "yellow" |
+| Pure position, lit-core isolation | saturation-gated lit lamp, energy per third | **YOLO bbox does not frame the 3-lamp housing** → lit lamp's position carries no state signal |
+
+The last point is the fundamental wall, and it is visible directly in `/traffic_light/status.diag`. For a
+light that is **ground-truth RED** (top lamp), across an entire approach (≈45 m → 15 m):
+
+- the lit-lamp brightness **centroid `y_norm` sits at ≈ 0.44–0.48 every frame** — the *middle* of the
+  YOLO box — never near the ≈ 0.17 expected for a top lamp;
+- per-third energy `[red, yellow, green]` keeps the top (red) and middle (yellow) bins within a few
+  percent of each other (e.g. `[5230, 5306, 2861]`, `[8244, 8464, 5668]`), so the per-frame raw state
+  flickers red ↔ yellow ↔ `low_contrast` with no stable winner;
+- the lit-lamp colour is a constant `lit_rgb ≈ [250, 225, 100]` (R≈G, amber) for the whole run,
+  confirming colour cannot separate red from yellow.
+
+**Root cause.** YOLOv11 (COCO "traffic light") returns a box whose framing of the lamp head is
+*inconsistent* — sometimes the full housing, often padded or centred on the lit lamp — so the lit lamp's
+position *within the box* is not a reliable function of the true state. Compounding it, at realistic
+approach distances the head is only **~17–45 px tall** (the three lamps ~6–15 px apart) and the lit
+lamp blooms, so even with bbox tightening the lamps are at/below the resolution needed to separate them.
+Colour offers no fallback because the rendering is amber for all three states (green is separable by
+channel dominance, but the red↔yellow pair — the safety-critical one — is not).
+
+**Conclusion.** The failure is **data-limited, not tuning-limited**: no threshold setting recovers a
+signal the pixels do not contain at this resolution/framing. Camera-only state would require one of
+(a) a **dedicated traffic-light-state classifier** trained on CARLA crops (not COCO presence detection),
+(b) **higher-resolution / closer** capture so the three lamps are individually resolvable, or
+(c) **geometric per-lamp sampling** — projecting each lamp's known 3D position (`carla_light_boxes.csv`
+has per-head `world_center_z` + `extent_z`) and reading brightness there, which sidesteps the YOLO box
+but leaves the pure-vision regime. What *does* work and is reusable: geometric ROI selection, YOLO
+presence confirmation, frame registration, and the temporal-smoothing/action layer.
+
+**Diagnostic tooling** built to reach this conclusion (useful for any future attempt): the
+`/traffic_light/status` `diag` block (`y_norm`, `rg`, `lit_rgb`, `lit_px`, `zone_energy`), a **6× lamp
+magnifier + 3-zone overlay** drawn in `debug_image`, and the SE(2) frame calibrator above.
 
 ---
 
 ## 7. Integration
 
-> *To be added.*
+The full closed loop run end-to-end on the town10 loop: **stereo VINS → MPC follows the recorded path
+→ traffic-light gate brakes the car at red lights**. The MPC drove on the **stereo** VINS state
+(GPS-registered into the `map` frame, `/vins_stereo_gps`), at horizon 15, with the traffic-light action
+gating throttle/brake; logged with `mpc_debug_log.py` to `logs/finalresult.csv` (186 s).
 
-The intended closed loop: **VINS state → MPC follows the recorded reference path → traffic-light
-action gates throttle/brake.** All three components run live today (VINS state drives the MPC around a
-full town10 lap; the traffic-light node publishes a stop/go action), but the combined evaluation —
-following a path *and* stopping at lights, end to end — has not yet been measured.
+**Result** — the car completed the lap *and* stopped at the lights:
+
+| Metric | Value |
+|--------|-------|
+| Lap distance (GT) | **439 m** (full loop) — ended 1.4 m from the route end |
+| Path-following x-track | **0.81 m RMSE**, 2.06 m max |
+| Cruise speed | ~5.5 m/s between lights |
+| Traffic-light stops | **2** brake-to-hold events (brake ≈ 0.95, speed → 0): at the spawn junction (~29 s) and a mid-loop junction at (−27, −12) (~41 s) |
+
+![integration](figures/integration_finalresult.png)
+
+The figure shows all three layers working together: the ego (driven on the stereo VINS estimate) tracks
+the reference loop to sub-metre accuracy (top-left, bottom-right), while the speed and control traces
+(top-right, bottom-left) show it cruising at ~5.5 m/s, **braking fully to a hold at each red light**
+(shaded), then resuming — i.e. the SLAM→MPC→traffic-light loop closes.
+
+**Caveats (honest scope).**
+- `mpc_debug_log.py` does **not** record the traffic-light state/action, so the two stops are
+  identified from their *signature* (full brake + speed→0 mid-route), which is exactly what the gate's
+  `stop` action produces — but the log can't independently prove the trigger was the light.
+- Per §6.2, the **camera-only light state is unreliable**, so a dependable gate uses the **ground-truth
+  light state** (`/carla/traffic_lights/gt_status`); this run demonstrates the *control* integration,
+  not camera-based perception of the light.
+- The MPC's *control* topic is the GPS-registered stereo odom (`/vins_stereo_gps`); raw `/vins_stereo`
+  is in the VINS-local frame (≈205 m from `map`) and cannot follow the map-frame path without that
+  registration.
+
+### 7.1 3D map reconstruction — VINS vs GT
+
+The other half of integration is the **map**: RTAB-Map built two 3D point clouds of the town10 loop —
+one on the **stereo VINS** odom (the run above, `3D_map/finalresult.ply`) and one on **GT** odom (a
+`drive:=coverage` sweep with `rtab_odom:=/gt_world_body/odometry`, `3D_map/gt_map.ply`). They are
+compared cloud-to-cloud with [`eval_map.py`](eval_map.py): **FPFH+RANSAC global registration → ICP**
+(to remove the VINS-world↔map frame offset), then nearest-point distances.
+
+| Metric (VINS map → GT map) | Value |
+|----------------------------|------:|
+| Mean point distance | **0.40 m** |
+| RMSE | **0.73 m** |
+| Hausdorff (p95) | 1.35 m |
+| Accuracy @0.5 m | **80.9 %** |
+| Completeness @0.5 m | **85.0 %** |
+| **F-score @0.5 m** | **82.9 %** |
+| ICP alignment fitness | 0.975 (inlier RMSE 0.46 m) |
+
+**What each metric means.** The raw ingredient is: for every point in one cloud, the distance to the
+*nearest* point in the other. Measuring **VINS→GT** asks "is what I built correct?"; **GT→VINS** asks
+"did I capture everything?".
+
+| Metric | In plain words | How it's computed | Better |
+|--------|----------------|-------------------|:------:|
+| Mean distance | average gap between the VINS map and the real surface | mean of VINS→GT nearest distances | lower |
+| RMSE | same, but punishes big errors more (squares them) | root-mean-square of those distances | lower |
+| Hausdorff (p95) | worst-case error, ignoring the worst 5% outliers | 95th percentile of VINS→GT distances | lower |
+| Accuracy @0.5 m | of what the SLAM *drew*, how much is near real geometry (**precision**) | % of VINS points with a GT point within 0.5 m | higher |
+| Completeness @0.5 m | of the *real world*, how much the SLAM captured (**recall**) | % of GT points with a VINS point within 0.5 m | higher |
+| **F-score @0.5 m** | single balanced score of the two above (**headline**) | harmonic mean of accuracy & completeness | higher |
+| Voxel IoU @0.3 m | overlap of occupied 30 cm boxes (very strict — see caveat 2) | shared boxes ÷ total boxes | higher |
+| ICP fitness | how trustworthy the *alignment* was (a sanity check, not map quality) | % of points that found a match when aligning | higher |
+
+Reading it: distances (mean/RMSE/Hausdorff) are in metres — **lower is better**; the percentages
+(accuracy/completeness/F-score) are **higher is better**. The **0.5 m** is the "how close is close
+enough" tolerance — tighten it and the percentages drop. **Accuracy vs completeness = precision vs
+recall**: accuracy punishes wrong/extra points, completeness punishes missing coverage, and F-score
+balances them. The **mean (0.40) vs RMSE (0.73) gap** says most points are very close but a *tail* of
+larger errors exists (the red regions at the loop ends below). ICP fitness comes first: at 0.975 the
+maps were lined up well, so the rest of the numbers are real.
+
+![map eval](figures/map_eval_vins_vs_gt.png)
+
+**Analysis.** After registration the VINS-built map reconstructs the GT-built map to **sub-metre**
+(0.40 m mean, 0.73 m RMSE, **83 % F-score @0.5 m**) — i.e. the map the SLAM stack produces live is
+metrically faithful to the ground-truth map, not just the trajectory. The overlay (left) shows the two
+loops coincide; the per-point heatmap (middle) is mostly < 0.5 m, with the larger errors at the loop
+extremities where stereo-VO drift accumulates before returning.
+
+**Caveats (in plain terms):**
+
+1. **We line the two maps up before measuring.** The VINS map is drawn in its own coordinate system —
+   shifted and rotated from the GT map — so we first slide and rotate it to sit on top of GT, then
+   measure how well they match. This means the numbers answer *"is the **shape** of the map right?"*,
+   not *"is it pinned to the exactly-right spot?"* (pinning it to the world is the GPS/registration job
+   from earlier). The simple "match the centres" line-up wasn't enough to undo the rotation (it only
+   got 25% of points to agree); a smarter feature-based line-up (FPFH+RANSAC) fixed that (98% agree).
+2. **Ignore the "Voxel IoU = 1.9%" number** — it looks alarming but isn't meaningful here. It chops
+   space into 30 cm boxes and only counts a point as "matching" if it lands in the *exact same box* as
+   GT, so even a tiny, harmless offset makes it look terrible. The **F-score** (how much of the map is
+   within half a metre of GT) is the number that actually reflects quality.
+3. **The GT map is the fair yardstick.** It was built by the **same cameras**, just given a perfect
+   position feed — so it's literally "the best map this sensor rig could make." Comparing the VINS map
+   against it tells us how much the SLAM stack's *own* position errors hurt the map.
 
 ---
 
@@ -712,11 +1008,25 @@ following a path *and* stopping at lights, end to end — has not yet been measu
 - **The IMU-on-smooth-motion failure is a genuine observability degeneracy**, not a bug — it persists
   across online/offline/live and is cured by varied motion, and matches VINS-Fusion behaviour on
   EuRoC/KITTI. The practical recommendation is **stereo+GPS** for normal CARLA driving.
-- **MPC and traffic-light detection are implemented and run live**, but lack standalone evaluation.
+- **MPC is implemented, runs live, and is tuned** (§5.1): on the town10 loop it follows the recorded
+  path at **0.67 m cross-track RMSE** (horizon 15, lookahead 2 m). Horizon sets lap *completion*
+  (only $H=15$ finishes — short = myopic/chatter, long = overshoot/crawl); lookahead sets tracking
+  *accuracy* (shorter hugs the path, less corner-cutting).
+- **Traffic-light *localization* works, but camera-only *state* classification does not.** Geometric ROI
+  selection + YOLO presence confirmation reliably find the light, but reading red/yellow/green from the
+  pixels fails — a **data limitation, not a tuning one** (§6.2): YOLO's box does not consistently frame
+  the 3-lamp housing (lit-lamp `y_norm ≈ 0.45` even for a ground-truth **red** light), the head is only
+  ~17–45 px tall at approach range, and all lamps render a similar amber (`lit_rgb ≈ [250,225,100]`) so
+  hue cannot separate red from yellow. Reliable state would need a CARLA-trained state classifier,
+  higher-resolution capture, or geometric per-lamp sampling (§6.2).
+- **The full loop closes end-to-end** (§7): driven on the stereo VINS state, the MPC completes the
+  439 m town10 lap at **0.81 m cross-track RMSE** and **brakes to a hold at the red lights** — SLAM,
+  control, and the traffic-light gate working together.
 
-**Next steps:** (1) close and measure the full SLAM + MPC + traffic-light loop; (2) quantify MPC
-path-tracking error against the reference; (3) report traffic-light detection precision/recall and
-state-transition latency.
+**Next steps:** (1) for traffic lights, either train a dedicated CARLA state classifier or fall back to
+geometric per-lamp sampling, then report precision/recall and state-transition latency, and feed *that*
+(not GT) state into the gate; (2) log the traffic-light state/action alongside the integration run so
+stop events are confirmed from the signal, not inferred.
 
 ---
 
@@ -795,12 +1105,12 @@ ros2 launch vins_fusion_ros2 carla_native_multi.launch.py \
 #    trajectory (MPC) on stereo VINS:
 ros2 launch vins_fusion_ros2 carla_native_multi.launch.py \
   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=trajectory \
-  mpc_state:=/vins_stereo_vel/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo
+  mpc_state:=/vins_stereo_vel/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo traffic_light:=true
 
 #    trajectory (MPC) on stereo+gps:
 ros2 launch vins_fusion_ros2 carla_native_multi.launch.py \
   town:=Town10HD spawn:=100.0,-10.0,1.0,0.0,0.0,90.0 drive:=trajectory \
-  mpc_state:=/vins_stereo_gps_map/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo_gps
+  mpc_state:=/vins_stereo_gps_map/odometry bootstrap_secs:=8.0 target_speed:=5.5 horizon:=15 variants:=stereo_gps traffic_light:=true
 
 # C: live plot
 python3 plot_result_rtab_cpp.py

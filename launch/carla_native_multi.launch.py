@@ -172,6 +172,11 @@ def generate_launch_description():
         DeclareLaunchArgument('rtab_db', default_value=os.path.expanduser('~/rtab_carla_live.db')),
         # Show the live RTAB-Map GUI (3D map, camera, loop-closure graph) while running.
         DeclareLaunchArgument('rtab_viz', default_value='false'),
+        # Gate the T-mode MPC on /traffic_light/action (stop->brake, slow->cap
+        # speed, go/stale->cruise). 'false' (default) = perception never touches
+        # control. tl_slow_speed = m/s used when the light says "slow".
+        DeclareLaunchArgument('traffic_light', default_value='false'),
+        DeclareLaunchArgument('tl_slow_speed', default_value='2.0'),
         SetEnvironmentVariable('LD_LIBRARY_PATH', ld_path),
         Node(
             package='vins_fusion_ros2',
@@ -186,7 +191,9 @@ def generate_launch_description():
                        '--bootstrap-secs', bootstrap_secs,
                        '--target-speed', target_speed,
                        '--horizon', horizon,
-                       '--variants', variants],
+                       '--variants', variants,
+                       '--traffic-light', LaunchConfiguration('traffic_light'),
+                       '--tl-slow-speed', LaunchConfiguration('tl_slow_speed')],
         ),
         rtab_group,
     ])

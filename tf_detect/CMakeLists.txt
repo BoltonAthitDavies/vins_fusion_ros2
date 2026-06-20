@@ -30,6 +30,8 @@ install(PROGRAMS
   scripts/dummy_script.py
   scripts/main.py
   scripts/traffic_light_state_node.py
+  scripts/route_turn_from_path.py
+  scripts/register_vins_to_map.py
   scripts/validate_projection.py
   DESTINATION lib/${PROJECT_NAME}
 )

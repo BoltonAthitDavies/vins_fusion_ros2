@@ -26,7 +26,9 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose2_d.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include "carla_world.hpp"
 #include "frame_collector.hpp"
@@ -96,6 +98,10 @@ int main(int argc, char **argv) {
   double mpc_target_speed = -1.0;// >=0 -> override MPC cruise speed (m/s)
   int mpc_horizon = -1;          // >0  -> override MPC prediction horizon (steps)
   std::string variants_arg;      // CSV of variants to run; empty -> derive/all
+  bool use_traffic_light = false;          // gate MPC speed on /traffic_light/action
+  std::string tl_action_topic = "/traffic_light/action";
+  double tl_slow_speed = 2.0;              // m/s when action == "slow"
+  double tl_stale_sec = 2.0;               // ignore action older than this -> "go"
 
   int positional = 0;
   for (size_t i = 2; i < plain.size(); ++i) {
@@ -124,6 +130,17 @@ int main(int argc, char **argv) {
       spawn_str = plain[++i];
     } else if (a == "--town" && i + 1 < plain.size()) {
       town = plain[++i];
+    } else if (a == "--traffic-light" && i + 1 < plain.size()) {
+      const std::string v = plain[++i];
+      use_traffic_light = (v == "1" || v == "true" || v == "True" || v == "on");
+    } else if (a == "--traffic-light") {
+      use_traffic_light = true;   // bare flag also accepted
+    } else if (a == "--tl-action-topic" && i + 1 < plain.size()) {
+      tl_action_topic = plain[++i];
+    } else if (a == "--tl-slow-speed" && i + 1 < plain.size()) {
+      tl_slow_speed = std::stod(plain[++i]);
+    } else if (a == "--tl-stale-sec" && i + 1 < plain.size()) {
+      tl_stale_sec = std::stod(plain[++i]);
     } else if (positional == 0) {
       host = a; positional++;
     } else if (positional == 1) {
@@ -193,6 +210,48 @@ int main(int argc, char **argv) {
         traj_target.valid = true;
       });
   bool traj_mode = start_trajectory;
+
+  // Publish the MPC's applied control so it can be logged for controller analysis
+  // (throttle/steer/brake effort, saturation, chatter). Packed into a Twist to avoid
+  // a carla_msgs dependency: linear.x = throttle [0,0.45], linear.y = brake [0,1],
+  // angular.z = steer [-1,1] (CARLA sign).
+  auto ctrl_pub = node->create_publisher<geometry_msgs::msg::Twist>(
+      "/carla/ego_vehicle/vehicle_control", rclcpp::QoS(rclcpp::KeepLast(10)));
+
+  // Traffic-light gate: subscribe to /traffic_light/action ("go"/"slow"/"stop")
+  // and modulate the MPC. stop -> force brake; slow -> cap target speed; go (or a
+  // stale/absent action) -> the configured cruise speed. Opt-in via --traffic-light
+  // so a run without the perception node is unaffected.
+  const double cruise_speed = mpc.targetSpeed();
+
+  // Ground-truth traffic-light state on /carla/traffic_lights/gt_status (JSON, no
+  // carla_msgs dependency) for labelling the camera detector / confusion matrix.
+  auto gt_lights_pub = node->create_publisher<std_msgs::msg::String>(
+      "/carla/traffic_lights/gt_status", rclcpp::QoS(rclcpp::KeepLast(5)));
+  auto tl_state_name = [](int s) -> const char * {
+    switch (s) {
+      case 0: return "red";
+      case 1: return "yellow";
+      case 2: return "green";
+      case 3: return "off";
+      default: return "unknown";
+    }
+  };
+  std::string tl_action = "go";
+  double tl_action_t = -1.0;          // node-clock seconds of last action
+  std::mutex tl_mtx;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr tl_sub;
+  if (use_traffic_light) {
+    tl_sub = node->create_subscription<std_msgs::msg::String>(
+        tl_action_topic, rclcpp::QoS(rclcpp::KeepLast(5)),
+        [&](const std_msgs::msg::String::SharedPtr m) {
+          std::lock_guard<std::mutex> lk(tl_mtx);
+          tl_action = m->data;
+          tl_action_t = node->now().seconds();
+        });
+    printf("[carla_cpp] traffic-light gating ON: %s (cruise=%.1f slow=%.1f stale=%.1fs)\n",
+           tl_action_topic.c_str(), cruise_speed, tl_slow_speed, tl_stale_sec);
+  }
 
   // Optional external state for the MPC. With --mpc-state /vins_.../odometry the
   // loop closes on the SAME estimate that play_gt_path.py anchors its targets to
@@ -356,16 +415,35 @@ int main(int argc, char **argv) {
         if (have_state) {
           carla_cpp::TrajTarget tgt;
           { std::lock_guard<std::mutex> lk(traj_mtx); tgt = traj_target; }
+
+          // Traffic-light gate. A stale/absent action falls back to "go".
+          std::string act = "go";
+          if (use_traffic_light) {
+            std::lock_guard<std::mutex> lk(tl_mtx);
+            double age = node->now().seconds() - tl_action_t;
+            if (tl_action_t >= 0.0 && age <= tl_stale_sec) act = tl_action;
+          }
+          // slow caps the cruise target; go/stop use cruise (stop overrides cmd below).
+          mpc.setTargetSpeed(act == "slow" ? std::min(cruise_speed, tl_slow_speed)
+                                           : cruise_speed);
+
           auto cmd = mpc.compute(ex, ey, eyaw, espeed, tgt, 0.0125);
+          if (act == "stop") {           // red light: hard stop and hold
+            cmd.throttle = 0.0;
+            cmd.brake = 1.0;
+          }
           world.applyControl(cmd);
+          { geometry_msgs::msg::Twist cm; cm.linear.x = cmd.throttle;
+            cm.linear.y = cmd.brake; cm.angular.z = cmd.steer; ctrl_pub->publish(cm); }
           // Periodic control debug: lets us tell a commanded stop (thr~0/brk>0)
           // from a physical stall (thr>0 but speed stays ~0).
           static int dbg = 0;
           if (tgt.valid && (dbg++ % 40 == 0))
             printf("[mpc] spd=%.2f thr=%.2f brk=%.2f steer=%+.2f  d2tgt=%.1f  "
-                   "pos=(%.1f,%.1f) tgt=(%.1f,%.1f)\n",
+                   "pos=(%.1f,%.1f) tgt=(%.1f,%.1f) tl=%s\n",
                    espeed, cmd.throttle, cmd.brake, cmd.steer,
-                   std::hypot(tgt.x - ex, tgt.y - ey), ex, ey, tgt.x, tgt.y);
+                   std::hypot(tgt.x - ex, tgt.y - ey), ex, ey, tgt.x, tgt.y,
+                   use_traffic_light ? act.c_str() : "off");
         }
       } else if (kb.interactive() && kb.manualDriving()) {
         // Manual control only from a TTY; otherwise the zero default fights the TM.
@@ -378,6 +456,25 @@ int main(int argc, char **argv) {
       if (!b.imu.empty()) {
         cur_t = b.t;
         ros.publishClock(b.t);
+
+        // GT traffic-light states (~5 Hz; lights only change at ~1 Hz).
+        static int gt_lc = 0;
+        if (gt_lc++ % 4 == 0) {
+          auto states = world.getTrafficLightStates();
+          std::string js = "{\"t\":" + std::to_string(b.t) + ",\"lights\":[";
+          for (size_t i = 0; i < states.size(); ++i) {
+            const auto &s = states[i];
+            js += "{\"actor_id\":" + std::to_string(s.actor_id) +
+                  ",\"opendrive_id\":\"" + s.opendrive_id + "\"" +
+                  ",\"state\":\"" + tl_state_name(s.state) + "\"}";
+            if (i + 1 < states.size()) js += ",";
+          }
+          js += "]}";
+          std_msgs::msg::String m;
+          m.data = js;
+          gt_lights_pub->publish(m);
+        }
+
         carla_cpp::EgoOdom eo;
         if (world.getEgoOdom(eo, b.t)) {
           ros.publishOdometry(eo);  // GT odometry

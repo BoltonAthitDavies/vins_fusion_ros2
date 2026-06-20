@@ -146,6 +146,10 @@ class YoloConfirmation:
     light_state: str = "unknown"
     light_state_confidence: Optional[float] = None
     color_scores: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bbox_height: float = 0.0
+    raw_light_state: str = "unknown"
+    state_reason: str = "disabled"
+    state_diag: Optional[Dict[str, object]] = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,10 @@ class ProjectionResult:
     light_state: str = "unknown"
     light_state_confidence: Optional[float] = None
     color_scores: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bbox_height: float = 0.0
+    raw_light_state: str = "unknown"
+    state_reason: str = "disabled"
+    state_diag: Optional[Dict[str, object]] = None
 
 
 TURN_RELATION_TO_LIGHT_BOX_INDEX = {
@@ -1767,59 +1775,154 @@ def clipped_box_crop(
     return crop if crop.size else None
 
 
+def _zone_pop_score(
+    zone: np.ndarray,
+    top_fraction: float = 0.15,
+    base_percentile: float = 25.0,
+) -> float:
+    """How much the brightest part of a zone POPS above its own dark floor.
+
+    score = mean(top-fraction brightest) - percentile(base_percentile).
+
+    A lit lamp is a bright blob surrounded by dark housing -> high peak, low
+    floor -> large pop. A zone filled with a uniformly bright BACKGROUND (sky,
+    a white wall, lens bloom) has a high peak too, but its floor is also high,
+    so the pop is small. This is what discriminates a real ON lamp from a
+    bright background; plain absolute brightness saturates to 255 for both.
+    """
+    flat = zone.reshape(-1).astype(np.float32)
+    if flat.size == 0:
+        return 0.0
+    k = max(1, int(round(flat.size * top_fraction)))
+    if k >= flat.size:
+        peak = float(flat.mean())
+    else:
+        peak = float(np.partition(flat, flat.size - k)[flat.size - k:].mean())
+    base = float(np.percentile(flat, base_percentile))
+    return max(0.0, peak - base)
+
+
+def _triangular(x: float, center: float, half_width: float) -> float:
+    return max(0.0, 1.0 - abs(x - center) / half_width)
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
 def classify_traffic_light_state(
     image: np.ndarray,
     box_xyxy: Tuple[float, float, float, float],
-) -> Tuple[str, Optional[float], Tuple[float, float, float]]:
+    x_band_lo: float = 0.30,
+    x_band_hi: float = 0.70,
+    score_ratio: float = 1.15,
+    min_zone_pop: float = 18.0,
+    color_weight: float = 0.6,
+    sat_min: float = 45.0,
+) -> Tuple[str, Optional[float], Tuple[float, float, float], str]:
+    """Classify red/yellow/green by combining TWO independent cues of the lit lamp.
+
+    Hue is unreliable (CARLA lamps look similarly yellowish) and a single cue
+    (fixed-zone brightness) is brittle when the bbox is loose or the lamp blooms.
+    So we fuse:
+
+      1. POSITION - vertical centroid of the actually-lit (bright) pixels inside
+         the central x-band, normalised to 0..1 (top->red, mid->yellow,
+         bottom->green). Using the real centroid (not 3 fixed slabs) tolerates a
+         loose/shifted bbox.
+      2. COLOUR - red-vs-green channel dominance at those lit pixels,
+         rg = (R-G)/(R+G). This is NOT hue: it reads which channel wins, which
+         stays stable even when the lamp looks washed-out yellowish.
+
+    Each cue votes a soft membership over (red, yellow, green); the votes are
+    blended (color_weight on colour). They reinforce when they agree and cancel
+    when they conflict, so an ambiguous lamp falls to "unknown" instead of a
+    confident wrong guess. Returns (state, confidence, (r,y,g) blended scores,
+    reason) with reason in {ok, low_contrast, too_dark, empty}.
+    """
     crop = clipped_box_crop(image, box_xyxy, padding=1)
-    if crop is None:
-        return "unknown", None, (0.0, 0.0, 0.0)
+    if crop is None or crop.shape[0] < 6:
+        return "unknown", None, (0.0, 0.0, 0.0), "empty", {}
 
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    value_threshold = max(80.0, float(np.percentile(value, 95)))
-    active = (value >= value_threshold) & (saturation >= 30)
-    if int(active.sum()) < 2:
-        value_threshold = max(80.0, float(np.percentile(value, 97)))
-        active = value >= value_threshold
+    height, width = crop.shape[:2]
+    x1 = int(round(max(0.0, min(0.49, x_band_lo)) * width))
+    x2 = int(round(max(0.51, min(1.0, x_band_hi)) * width))
+    if x2 <= x1:
+        x1, x2 = 0, width
+    band = crop[:, x1:x2]
+    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+    value = hsv[:, :, 2].astype(np.float32)
+    sat = hsv[:, :, 1].astype(np.float32)
 
-    weight = (value.astype(float) / 255.0) * (1.0 + saturation.astype(float) / 255.0)
-    active_weight = weight * active.astype(float)
-    total_score = float(active_weight.sum())
-    if total_score < 1e-6:
-        return "unknown", None, (0.0, 0.0, 0.0)
+    # Lit pixels = the brightest cluster that also POPS above the local floor
+    # (a uniformly bright background such as sky never makes the cut)...
+    floor = float(np.percentile(value, 40))
+    peak = float(value.max())
+    strength = peak - floor
+    if strength < min_zone_pop:
+        return "unknown", None, (0.0, 0.0, 0.0), "too_dark", {"strength": round(strength, 1)}
+    # High threshold keeps only the bright lamp CORE, not the dim bloom/glow that
+    # spills into the neighbouring third and smears the red/yellow decision.
+    threshold = floor + 0.72 * strength
+    # ...AND are coloured: the LIT lamp glows with colour, while the other two
+    # lamps are dark grey and the background sky / walls are pale grey -- both are
+    # rejected here, leaving only the lit lamp.
+    mask = (value >= threshold) & (sat >= sat_min)
+    if int(mask.sum()) < 2:
+        return "unknown", None, (0.0, 0.0, 0.0), "no_lamp", {
+            "strength": round(strength, 1),
+            "max_sat": round(float(sat.max()), 0),
+        }
 
-    height = crop.shape[0]
-    y_positions = np.arange(height, dtype=float)[:, None]
-    y_norm = float((active_weight * y_positions).sum() / total_score)
-    if height > 1:
-        y_norm /= float(height - 1)
+    # Brightness-weighted vertical centroid: the bright lamp core pulls the
+    # centroid, so scattered dim saturated pixels do not drag it to the middle.
+    ys, xs = np.nonzero(mask)
+    weights = (value[ys, xs] - floor).clip(min=1.0)
+    y_norm = float(np.average(ys.astype(np.float32), weights=weights)) / max(1.0, height - 1.0)
 
-    top_mask = np.zeros_like(active, dtype=bool)
-    middle_mask = np.zeros_like(active, dtype=bool)
-    bottom_mask = np.zeros_like(active, dtype=bool)
-    top_end = max(1, int(round(height / 3.0)))
-    bottom_start = min(height - 1, int(round(2.0 * height / 3.0)))
-    top_mask[:top_end, :] = True
-    middle_mask[top_end:bottom_start, :] = True
-    bottom_mask[bottom_start:, :] = True
-    scores = {
-        "red": float(active_weight[top_mask].sum()),
-        "yellow": float(active_weight[middle_mask].sum()),
-        "green": float(active_weight[bottom_mask].sum()),
+    blue = band[:, :, 0].astype(np.float32)
+    green = band[:, :, 1].astype(np.float32)
+    red = band[:, :, 2].astype(np.float32)
+    r_mean = float(red[mask].mean())
+    g_mean = float(green[mask].mean())
+    b_mean = float(blue[mask].mean())
+    rg = (r_mean - g_mean) / (r_mean + g_mean + 1.0)  # >0 reddish, <0 greenish
+    diag = {
+        "y_norm": round(y_norm, 3),
+        "rg": round(rg, 3),
+        "lit_px": int(mask.sum()),
+        "lit_rgb": [round(r_mean), round(g_mean), round(b_mean)],
+        "strength": round(strength, 1),
     }
 
-    if y_norm < 0.38:
-        state = "red"
-    elif y_norm > 0.62:
-        state = "green"
-    else:
-        state = "yellow"
-    confidence = scores[state] / max(sum(scores.values()), 1e-9)
-    if confidence < 0.35:
-        return "unknown", confidence, (scores["red"], scores["yellow"], scores["green"])
-    return state, confidence, (scores["red"], scores["yellow"], scores["green"])
+    # PURE POSITION. The lit lamp is the only bright+coloured region (the other two
+    # lamps are dark grey and the background is pale grey -- both already removed by
+    # `mask`). Sum the lit-lamp energy in each vertical third; the heaviest third is
+    # the active lamp: top=red, middle=yellow, bottom=green. We do NOT try to read
+    # the lamp's hue (red/yellow/green all render as a similar yellowish glow in
+    # CARLA) -- only WHERE the lit lamp sits.
+    energy = (value - floor).clip(min=0.0) * mask
+    top_end = max(1, int(round(height / 3.0)))
+    bottom_start = min(height - 1, int(round(2.0 * height / 3.0)))
+    red_e = float(energy[:top_end, :].sum())
+    yellow_e = float(energy[top_end:bottom_start, :].sum())
+    green_e = float(energy[bottom_start:, :].sum())
+    scores = (red_e, yellow_e, green_e)
+    total = red_e + yellow_e + green_e
+    confidence = (max(scores) / total) if total > 1e-6 else None
+    display = tuple(round(s * 100.0 / total, 1) if total > 1e-6 else 0.0 for s in scores)
+    diag["zone_energy"] = [round(red_e), round(yellow_e), round(green_e)]
+
+    if total <= 1e-6:
+        return "unknown", confidence, display, "no_lamp", diag
+
+    order = sorted(scores, reverse=True)
+    if order[0] < order[1] * score_ratio:
+        # lit lamp straddles a zone boundary / two thirds tie -> ambiguous
+        return "unknown", confidence, display, "low_contrast", diag
+
+    state = ("red", "yellow", "green")[int(np.argmax(scores))]
+    return state, confidence, display, "ok", diag
 
 
 def color_for_light_state(state: str) -> Tuple[int, int, int]:
@@ -1846,6 +1949,13 @@ def confirm_traffic_light_in_roi(
     yolo_imgsz: int,
     yolo_class_id: int,
     yolo_device: str,
+    state_distance: float = 0.0,
+    min_state_bbox_height_px: float = 25.0,
+    max_state_distance_m: float = 40.0,
+    state_score_ratio: float = 1.15,
+    state_x_band_lo: float = 0.30,
+    state_x_band_hi: float = 0.70,
+    state_sat_min: float = 45.0,
 ) -> YoloConfirmation:
     roi = expanded_roi_xyxy(
         u,
@@ -1901,18 +2011,40 @@ def confirm_traffic_light_in_roi(
 
     if best_box is None:
         return YoloConfirmation(status="not_found", roi_xyxy=roi)
-    light_state, state_confidence, color_scores = classify_traffic_light_state(
+
+    bbox_height = float(best_box[3] - best_box[1])
+    raw_state, state_confidence, color_scores, classify_reason, state_diag = classify_traffic_light_state(
         source_image,
         best_box,
+        x_band_lo=state_x_band_lo,
+        x_band_hi=state_x_band_hi,
+        score_ratio=state_score_ratio,
+        sat_min=state_sat_min,
     )
+
+    # Gate the raw classification: only trust the colour when the lamp is close
+    # enough and big enough to read, and the brightest zone clearly wins.
+    if bbox_height < min_state_bbox_height_px:
+        gated_state, reason = "unknown", "bbox_too_small"
+    elif state_distance > max_state_distance_m > 0.0:
+        gated_state, reason = "unknown", "too_far"
+    elif classify_reason != "ok":
+        gated_state, reason = "unknown", classify_reason
+    else:
+        gated_state, reason = raw_state, "confirmed"
+
     return YoloConfirmation(
         status="confirmed",
         confidence=best_confidence,
         box_xyxy=best_box,
         roi_xyxy=roi,
-        light_state=light_state,
+        light_state=gated_state,
         light_state_confidence=state_confidence,
         color_scores=color_scores,
+        bbox_height=bbox_height,
+        raw_light_state=raw_state,
+        state_reason=reason,
+        state_diag=state_diag,
     )
 
 
@@ -1960,6 +2092,13 @@ def draw_projection(
     yolo_roi_scale: float = 5.0,
     yolo_min_roi_width: float = 160.0,
     yolo_min_roi_height: float = 180.0,
+    min_state_bbox_height_px: float = 25.0,
+    max_state_distance_m: float = 40.0,
+    state_score_ratio: float = 1.15,
+    state_x_band_lo: float = 0.30,
+    state_x_band_hi: float = 0.70,
+    state_sat_min: float = 45.0,
+    draw_state_zones: bool = True,
 ) -> List[ProjectionResult]:
     projections: List[ProjectionResult] = []
     fallback_target = TrafficLightBox(
@@ -2024,6 +2163,13 @@ def draw_projection(
                 yolo_imgsz,
                 yolo_class_id,
                 yolo_device,
+                state_distance=depth,
+                min_state_bbox_height_px=min_state_bbox_height_px,
+                max_state_distance_m=max_state_distance_m,
+                state_score_ratio=state_score_ratio,
+                state_x_band_lo=state_x_band_lo,
+                state_x_band_hi=state_x_band_hi,
+                state_sat_min=state_sat_min,
             )
             if yolo_confirmation.roi_xyxy is not None:
                 roi_left, roi_top, roi_right, roi_bottom = yolo_confirmation.roi_xyxy
@@ -2057,6 +2203,21 @@ def draw_projection(
                     (int(round(yx1)), max(18, int(round(yy1 - 6)))),
                     state_color,
                 )
+                if draw_state_zones:
+                    _draw_state_zone_overlay(
+                        image,
+                        yolo_confirmation.box_xyxy,
+                        yolo_confirmation.color_scores,
+                        yolo_confirmation.raw_light_state,
+                        state_x_band_lo,
+                        state_x_band_hi,
+                    )
+                    _draw_lamp_magnifier(
+                        image,
+                        source_image,
+                        yolo_confirmation.box_xyxy,
+                        yolo_confirmation.raw_light_state,
+                    )
 
         roi_label = (
             signal.signal_id
@@ -2083,10 +2244,92 @@ def draw_projection(
                 light_state=yolo_confirmation.light_state,
                 light_state_confidence=yolo_confirmation.light_state_confidence,
                 color_scores=yolo_confirmation.color_scores,
+                bbox_height=yolo_confirmation.bbox_height,
+                raw_light_state=yolo_confirmation.raw_light_state,
+                state_reason=yolo_confirmation.state_reason,
+                state_diag=yolo_confirmation.state_diag,
             )
         )
 
     return projections
+
+
+def _draw_state_zone_overlay(
+    image: np.ndarray,
+    box_xyxy: Tuple[float, float, float, float],
+    color_scores: Tuple[float, float, float],
+    raw_state: str,
+    x_band_lo: float,
+    x_band_hi: float,
+) -> None:
+    """Overlay the 3 horizontal state zones + central x-band + per-zone scores
+    on the YOLO box, so the brightness scoring can be tuned visually."""
+    x1, y1, x2, y2 = (int(round(v)) for v in box_xyxy)
+    if x2 <= x1 or y2 <= y1:
+        return
+    height = y2 - y1
+    width = x2 - x1
+    third = height / 3.0
+    z1 = y1 + int(round(third))
+    z2 = y1 + int(round(2.0 * third))
+    bx1 = x1 + int(round(x_band_lo * width))
+    bx2 = x1 + int(round(x_band_hi * width))
+
+    # zone divider lines + central band guides
+    cv2.line(image, (x1, z1), (x2, z1), (180, 180, 180), 1)
+    cv2.line(image, (x1, z2), (x2, z2), (180, 180, 180), 1)
+    cv2.line(image, (bx1, y1), (bx1, y2), (90, 90, 90), 1)
+    cv2.line(image, (bx2, y1), (bx2, y2), (90, 90, 90), 1)
+
+    labels = (("R", color_scores[0], y1), ("Y", color_scores[1], z1), ("G", color_scores[2], z2))
+    best_idx = int(np.argmax(color_scores)) if any(color_scores) else -1
+    for idx, (tag, score, zone_top) in enumerate(labels):
+        is_best = idx == best_idx and raw_state in ("red", "yellow", "green")
+        color = (0, 255, 0) if is_best else (200, 200, 200)
+        cv2.putText(
+            image,
+            f"{tag}:{score:.0f}",
+            (x2 + 2, zone_top + 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_lamp_magnifier(
+    image: np.ndarray,
+    source_image: Optional[np.ndarray],
+    box_xyxy: Tuple[float, float, float, float],
+    raw_state: str,
+    scale: int = 6,
+    margin: int = 6,
+) -> None:
+    """Paste an enlarged copy of the exact YOLO-box crop into the top-right
+    corner of the debug image, so you can SEE what the classifier reads."""
+    if source_image is None:
+        return
+    x1, y1, x2, y2 = (int(round(v)) for v in box_xyxy)
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(source_image.shape[1], x2); y2 = min(source_image.shape[0], y2)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return
+    crop = source_image[y1:y2, x1:x2]
+    mag = cv2.resize(crop, (crop.shape[1] * scale, crop.shape[0] * scale), interpolation=cv2.INTER_NEAREST)
+    mh, mw = mag.shape[:2]
+    img_h, img_w = image.shape[:2]
+    if mw > img_w - 2 * margin or mh > img_h - 2 * margin:
+        return
+    px = img_w - mw - margin
+    py = margin
+    image[py:py + mh, px:px + mw] = mag
+    color = color_for_light_state(raw_state)
+    cv2.rectangle(image, (px - 1, py - 1), (px + mw, py + mh), color, 1)
+    # thirds guide on the magnified view
+    for f in (1.0 / 3.0, 2.0 / 3.0):
+        yline = py + int(round(mh * f))
+        cv2.line(image, (px, yline), (px + mw, yline), (160, 160, 160), 1)
 
 
 def write_event_rows(

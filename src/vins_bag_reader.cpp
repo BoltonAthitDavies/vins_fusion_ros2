@@ -96,7 +96,9 @@ int main(int argc, char **argv) {
         if (!gps_mode)
           fcsv << std::fixed << std::setprecision(9) << od.timestamp << ","
                << od.position.x() << "," << od.position.y() << ","
-               << od.position.z() << "\n";
+               << od.position.z() << "," << od.orientation.w() << ","
+               << od.orientation.x() << "," << od.orientation.y() << ","
+               << od.orientation.z() << "\n";
         { std::lock_guard<std::mutex> l(vmtx); vio_poses.push_back(od); }
         prev = od.timestamp;
         last_logged.store(od.timestamp);
@@ -188,7 +190,9 @@ int main(int argc, char **argv) {
     for (const auto &ps : globalOpt.global_path.poses) {
       double t = ps.header.stamp.sec + ps.header.stamp.nanosec * 1e-9;
       fo << std::fixed << std::setprecision(9) << t << "," << ps.pose.position.x
-         << "," << ps.pose.position.y << "," << ps.pose.position.z << "\n";
+         << "," << ps.pose.position.y << "," << ps.pose.position.z << ","
+         << ps.pose.orientation.w << "," << ps.pose.orientation.x << ","
+         << ps.pose.orientation.y << "," << ps.pose.orientation.z << "\n";
     }
     fprintf(stderr, "[vins_bag_reader] GPS: vio_poses=%zu gps=%zu matched=%zu path=%zu\n",
             vio_poses.size(), gps_buf.size(), matched, globalOpt.global_path.poses.size());
