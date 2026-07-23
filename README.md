@@ -270,6 +270,83 @@ when a keyframe leaves the window it is **marginalized** into the prior $r_p$ so
 kept without unbounded growth. GPS, when enabled, is a **separate** pose-graph stage (`global_fusion`,
 below). The state, cost, and residuals that follow describe that back-end optimization.
 
+**VINS node internals.** The same ROS-node/topic style as the [topic graph](#ros-2-topic-graph) above,
+but *inside* one `vins_<variant>` node — the front-end → back-end dataflow of the C++ `Estimator`
+([`estimator.cpp`](vins/src/estimator/estimator.cpp),
+[`feature_tracker.cpp`](vins/src/featureTracker/feature_tracker.cpp)). Boxes are pipeline stages
+(labelled with the actual method names); the three Ceres factor groups map one-to-one onto the residual
+terms $r_p$, $r_{\mathcal{B}}$, $r_{\mathcal{C}}$ of the cost function below.
+
+```mermaid
+flowchart TB
+  subgraph IN["Sensor inputs (per variant)"]
+    IMG["stereo images<br/>inputImage()"]
+    IMU["IMU 200 Hz<br/>inputIMU()"]
+  end
+
+  subgraph FE["Front end — FeatureTracker"]
+    TRK["trackImage()<br/>KLT optical flow · max_cnt 150 · min_dist 30 px<br/>flow_back = forward-backward check"]
+  end
+
+  subgraph BE["Back end — Estimator::processMeasurements()"]
+    PRE["processIMU()<br/>IMU pre-integration (integration_base)"]
+    FM["feature_manager<br/>triangulate · inverse-depth λ per feature"]
+    KF["setMarginalizationFlag()<br/>keyframe? (parallax &gt; keyframe_parallax)"]
+    INIT["initialization<br/>processStereo{With,Without}ImuInitialization<br/>initialStructure / visualInitialAlign"]
+    OPT["optimize()<br/>Ceres sliding window · 10 keyframes"]
+    OUT["outliersRejection()"]
+    SW["slideWindow()<br/>slideWindowOld / slideWindowNew"]
+  end
+
+  subgraph FAC["Ceres cost — factor groups"]
+    FP["marginalization prior<br/>r_p"]
+    FB["IMU factor<br/>r_B"]
+    FC["projection factors<br/>r_C · TwoFrameOneCam / TwoFrameTwoCam / OneFrameTwoCam"]
+  end
+
+  ODOM(["/vins_&lt;variant&gt;/odometry<br/>getVisualInertialOdom()"])
+
+  subgraph MAP["3D mapping / loop closure — rtabmap (visual_odometry: false)"]
+    RREG["stereo registration<br/>Vis/MinInliers 20 · Vis/MaxDepth 20 m · Stereo/MinDisparity 2.0"]
+    RLOOP["loop-closure detection<br/>Kp/MaxFeatures 250 · Rtabmap/LoopGPS"]
+    ROPT["graph optimization<br/>Optimizer/Robust · 6-DOF (Reg/Force3DoF false)"]
+  end
+
+  ROUT(["/rtabmap/corrected_odom (MPC state)<br/>/rtabmap/mapPath · 3D point cloud"])
+
+  IMG --> TRK --> FM
+  IMU --> PRE --> KF
+  FM --> KF --> INIT --> OPT
+  PRE -. pre-integrated α,β,γ .-> FB
+  FM  -. reprojection .-> FC
+  FP --> OPT
+  FB --> OPT
+  FC --> OPT
+  OPT --> OUT --> SW
+  SW -. marginalize dropped KF → new prior .-> FP
+  OPT --> ODOM
+
+  ODOM -- "rtab_odom (world→body)" --> RREG
+  IMG  -. stereo pair + camera_info .-> RREG
+  RREG --> RLOOP --> ROPT --> ROUT
+  ROPT -. loop-closure correction .-> ROUT
+```
+
+The loop runs once per stereo frame (20 Hz): the front end tracks features, the back end pre-integrates
+the IMU between keyframes, decides whether the new frame is a keyframe, (re)initializes if needed, then
+`optimize()` solves the sliding-window bundle adjustment over the three factor groups and publishes the
+odometry. When a keyframe leaves the window, `slideWindow()` **marginalizes** it into the prior $r_p$ —
+the dashed feedback edge — so the window stays bounded. The `stereo` variant skips the IMU column
+(`processIMU`/`r_B`); `stereo+imu` uses it; GPS is the separate `global_fusion` stage from the topic
+graph, not part of this node.
+
+Downstream, **rtabmap** (§4.2(d)) does **not** compute its own odometry (`visual_odometry: false`) —
+it consumes the VINS `/vins_<variant>/odometry` as its `rtab_odom` plus the same live stereo pair,
+detects loop closures and runs a robust 6-DOF graph optimization, then republishes the loop-closure-
+corrected pose as `/rtabmap/corrected_odom` (usable as the MPC state) alongside `/rtabmap/mapPath` and
+the 3D point cloud. It is a separate ROS node — shown here to close the perception-to-map path — not a
+stage of the VINS estimator.
+
 **State** — sliding window of $n{+}1$ keyframes and $m$ features. Each keyframe state $x_k$ holds
 position, velocity, orientation, accelerometer bias and gyro bias; $x_c$ is the camera↔IMU extrinsic;
 $\lambda_l$ is the inverse depth of feature $l$:
