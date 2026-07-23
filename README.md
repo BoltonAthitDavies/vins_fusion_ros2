@@ -62,6 +62,84 @@ tracks a reference path, and gates throttle/brake on a camera-based traffic-ligh
                                        └────────────────┘
 ```
 
+### ROS 2 topic graph
+
+The diagram above is the *logical* data flow; below is the actual **ROS 2 node/topic graph** for the
+live closed loop (`drive:=trajectory`, `variants:=stereo`, `traffic_light:=true`) — boxes are ROS
+nodes, edges are topics. The four SLAM variants and the `global_fusion`/`smooth_odom` stages are all
+shown; a given run activates only the branch feeding its selected `mpc_state`. Topic names are the
+real ones from [`ros_output.cpp`](src/carla_cpp/ros_output.cpp), the `global_fusion` remaps in
+§[Commands](#9-commands), and the traffic-light nodes (§6).
+
+```mermaid
+flowchart LR
+  subgraph CARLA["CARLA native bridge — carla_vins_multi_node (sync mode)"]
+    BR(["carla_world / ros_output"])
+  end
+
+  subgraph EST["State estimation (VINS-Fusion + global_fusion)"]
+    VS(["vins_stereo"])
+    VSI(["vins_stereo_imu"])
+    GF1(["global_fusion&nbsp;·&nbsp;gfus_stereo"])
+    GF2(["global_fusion&nbsp;·&nbsp;gfus_stereo_imu"])
+    SM(["smooth_odom.py<br/>(register + velocity-fill)"])
+  end
+
+  subgraph CTRL["Control"]
+    PGT(["play_gt_path.py"])
+    MPC(["sampling MPC — carla_vins_multi_node"])
+  end
+
+  subgraph PERC["Traffic-light perception (tf_detect)"]
+    RT(["route_turn_from_path.py"])
+    TL(["traffic_light_state_node.py"])
+  end
+
+  subgraph MAP["3D mapping"]
+    RTAB(["rtabmap"])
+  end
+
+  %% ---- sensors out of the bridge ----
+  BR -- "cam_front_left/image + camera_info<br/>cam_front_right/image + camera_info (20 Hz)" --> VS
+  BR -- "stereo pair + camera_info" --> VSI
+  BR -- "stereo pair + camera_info" --> RTAB
+  BR -- "cam_front_right/image + camera_info" --> TL
+  BR -- "/carla/ego_vehicle/imu (200 Hz)" --> VSI
+  BR -- "/carla/ego_vehicle/gnss (10 Hz)" --> GF1
+  BR -- "/carla/ego_vehicle/gnss" --> GF2
+  BR -. "/carla/ego_vehicle/noise_odometry (bootstrap)" .-> MPC
+  BR -. "/carla/traffic_lights/gt_status (reliable gate)" .-> TL
+
+  %% ---- estimation chain ----
+  VS  -- "/vins_stereo/odometry" --> GF1
+  VS  -- "/vins_stereo/odometry" --> SM
+  VS  -- "/vins_stereo/odometry" --> RTAB
+  VSI -- "/vins_stereo_imu/odometry" --> GF2
+  GF1 -- "/vins_stereo_gps/odometry" --> MPC
+  GF2 -- "/vins_stereo_imu_gps/odometry" --> MPC
+  SM  -- "/vins_stereo_vel/odometry (mpc_state)" --> MPC
+  SM  -- "/vins_stereo_vel/odometry" --> TL
+
+  %% ---- control + perception loop ----
+  PGT -- "/carla/ego_vehicle/trajectory_cmd" --> MPC
+  PGT -- "/carla/ego_vehicle/trajectory_cmd" --> RT
+  RT  -- "/traffic_light/route_turn" --> TL
+  TL  -- "/traffic_light/action (stop/slow/go)" --> MPC
+  MPC == "/carla/ego_vehicle/vehicle_control" ==> BR
+
+  %% ---- side outputs ----
+  TL   -. "/traffic_light/{state,status,debug_image}" .-> VIZ(["rqt / debug view"])
+  RTAB -. "/rtabmap/mapPath, corrected_odom" .-> VIZ
+```
+
+The **thick edge** (`/carla/ego_vehicle/vehicle_control` → bridge) is what closes the loop: the MPC's
+command is applied, the world ticks once, and the next sensor frame is produced (§4.4, *live*). Solid
+edges are the active data path; **dashed** edges are optional/alternate inputs — the GT-based light
+gate, the bootstrap odom, and the visualization sinks. The replay paths of §4.4 use the **same
+estimation subgraph** (`vins_*` → `global_fusion` → `smooth_odom`); only the source of the sensor
+topics changes (`ros2 bag play` for online, `vins_bag_reader`'s direct read for offline) and the
+control/perception loop is absent.
+
 ---
 
 ## 2. Environment setup
