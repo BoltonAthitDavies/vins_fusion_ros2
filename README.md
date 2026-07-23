@@ -304,7 +304,12 @@ flowchart TB
     FC["projection factors<br/>r_C · TwoFrameOneCam / TwoFrameTwoCam / OneFrameTwoCam"]
   end
 
-  ODOM(["/vins_&lt;variant&gt;/odometry<br/>getVisualInertialOdom()"])
+  subgraph VOUT["VINS final output — vins_publisher.cpp"]
+    ODOM(["/vins_&lt;variant&gt;/odometry<br/>getVisualInertialOdom()"])
+    PATH(["/vins_estimator/path<br/>getKeyPoses()"])
+  end
+
+  DOWN(["downstream consumers<br/>global_fusion · smooth_odom · MPC (see topic graph)"])
 
   subgraph MAP["3D mapping / loop closure — rtabmap (visual_odometry: false)"]
     RREG["stereo registration<br/>Vis/MinInliers 20 · Vis/MaxDepth 20 m · Stereo/MinDisparity 2.0"]
@@ -324,18 +329,26 @@ flowchart TB
   FC --> OPT
   OPT --> OUT --> SW
   SW -. marginalize dropped KF → new prior .-> FP
-  OPT --> ODOM
+  OPT ==> ODOM
+  OPT ==> PATH
+  ODOM ==> DOWN
 
   ODOM -- "rtab_odom (world→body)" --> RREG
   IMG  -. stereo pair + camera_info .-> RREG
   RREG --> RLOOP --> ROPT --> ROUT
   ROPT -. loop-closure correction .-> ROUT
+
+  classDef out fill:#2e7d32,stroke:#1b5e20,color:#fff,stroke-width:2px;
+  class ODOM,PATH,DOWN out;
 ```
 
 The loop runs once per stereo frame (20 Hz): the front end tracks features, the back end pre-integrates
 the IMU between keyframes, decides whether the new frame is a keyframe, (re)initializes if needed, then
-`optimize()` solves the sliding-window bundle adjustment over the three factor groups and publishes the
-odometry. When a keyframe leaves the window, `slideWindow()` **marginalizes** it into the prior $r_p$ —
+`optimize()` solves the sliding-window bundle adjustment over the three factor groups and publishes its
+**final output** (green): the pose estimate `/vins_<variant>/odometry` (`getVisualInertialOdom()`) and
+the trajectory `/vins_estimator/path` (`getKeyPoses()`), which feed the downstream `global_fusion` /
+`smooth_odom` / MPC consumers of the topic graph. When a keyframe leaves the window, `slideWindow()`
+**marginalizes** it into the prior $r_p$ —
 the dashed feedback edge — so the window stays bounded. The `stereo` variant skips the IMU column
 (`processIMU`/`r_B`); `stereo+imu` uses it; GPS is the separate `global_fusion` stage from the topic
 graph, not part of this node.
