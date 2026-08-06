@@ -8,10 +8,22 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-find_package(Glog)
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(Ceres REQUIRED)
+# When built as a subdirectory of vins_fusion_ros2 (the normal case here), the
+# parent CMakeLists.txt already ran find_package(Ceres REQUIRED) before
+# add_subdirectory(vins), so Ceres::ceres and CERES_* are already set and
+# visible in this scope. Re-running find_package(Ceres) here re-executes its
+# config script, which re-resolves glog and errors trying to redefine the
+# glog::glog imported target ("another target with the same name already
+# exists") — so only look it up if it isn't already available (e.g. building
+# vins/ standalone).
+if(NOT TARGET Ceres::ceres)
+  find_package(Ceres REQUIRED)
+endif()
+if(NOT TARGET glog::glog)
+  find_package(Glog)
+endif()
 include_directories(${CERES_INCLUDE_DIRS})
 find_package(Eigen3)
 

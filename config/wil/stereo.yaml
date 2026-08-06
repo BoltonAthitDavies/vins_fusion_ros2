@@ -1,0 +1,78 @@
+%YAML:1.0
+
+# STEREO-ONLY (imu:0). WiL rig, built from real calibration data in this folder:
+#   - fisheye_calibration.json      -> cam0_fisheye.yaml / cam1_fisheye.yaml (mono intrinsics)
+#   - camera0_rot_trans.dat/camera1_rot_trans.dat -> body_T_cam0 / body_T_cam1 below (stereo extrinsics)
+imu: 0
+num_of_cam: 2
+
+imu_topic: "/imu0"                    # unused while imu:0; real yaw sensor topic is /hwt101ct_yaw_publisher
+image0_topic: "/cam0/image_raw"       # matches robot_camera/launch/dual_camera.launch.py (v4l2_camera_node, namespace cam0)
+image1_topic: "/cam1/image_raw"       # matches robot_camera/launch/dual_camera.launch.py (v4l2_camera_node, namespace cam1)
+output_path: "~/output/wil_stereo/"
+
+cam0_calib: "cam0_fisheye.yaml"
+cam1_calib: "cam1_fisheye.yaml"
+image_width: 1920
+image_height: 1080
+
+use_gpu: 0
+use_gpu_acc_flow: 0
+use_gpu_ceres: 0
+
+# Extrinsics — derived from camera0_rot_trans.dat / camera1_rot_trans.dat.
+# cam0 is treated as the body origin (R=I, T=0 in the .dat file). body_T_cam0 is the
+# camera-optical-frame -> body/ENU-frame axis convention used throughout this repo's
+# configs (cam x-right/y-down/z-forward -> body x-forward/y-left/z-up).
+# body_T_cam1 = body_T_cam0 * cam0_T_cam1, where cam0_T_cam1 is the inverse of the
+# calibrated (R, T) that maps cam0-frame points into cam1-frame points, i.e.
+# cam0_T_cam1.R = R^T, cam0_T_cam1.t = -R^T @ T. Baseline is ~3.15cm with a ~1.3deg
+# relative rotation between the two cameras (a real, slightly non-parallel rig).
+estimate_extrinsic: 0
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  0.0,
+          -1.0,  0.0,  0.0,  0.0,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0222955695, -0.0203024087,  0.9995452565,  0.0000794828,
+          -0.9997505246,  0.0008874595,  0.0223181739,  0.0315311332,
+          -0.0013401687, -0.9997934910, -0.0202775573, -0.0005400126,
+           0.0,            0.0,           0.0,           1.0]
+
+# Feature tracker
+multiple_thread: 1
+image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
+max_cnt: 150
+min_dist: 30
+freq: 20
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+# Optimization (heavier, offline-accuracy tuning)
+max_solver_time: 0.08
+max_num_iterations: 100
+keyframe_parallax: 5.0
+
+# IMU noise — Bosch BNO055 (unused with imu:0, kept for parity)
+acc_n: 0.00147
+gyr_n: 0.000244
+acc_w: 0.0005
+gyr_w: 0.00002
+g_norm: 9.81007
+
+estimate_td: 0
+td: 0.0
+
+load_previous_pose_graph: 0
+pose_graph_save_path: "~/output/wil_stereo/pose_graph/"
+save_image: 1

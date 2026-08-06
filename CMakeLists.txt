@@ -10,7 +10,12 @@ set(CMAKE_BUILD_TYPE Release)
 # OpenCV rtabmap is built against. This keeps the whole stack on one consistent
 # non-CUDA OpenCV (no cv::cuda modules linked anywhere). GPU is also off at the
 # code level (vins/CMakeLists sets VINS_HAS_CUDA FALSE -> no GPU_MODE).
-set(OpenCV_DIR $ENV{HOME}/local_ocv/lib/cmake/opencv4 CACHE PATH "" FORCE)
+# Only applies on machines that have this dev OpenCV built; elsewhere (e.g. the
+# LaneTracking robot's Docker image) find_package(OpenCV) below falls back to
+# whatever system OpenCV is already installed.
+if(EXISTS "$ENV{HOME}/local_ocv/lib/cmake/opencv4")
+  set(OpenCV_DIR $ENV{HOME}/local_ocv/lib/cmake/opencv4 CACHE PATH "" FORCE)
+endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
@@ -42,6 +47,14 @@ if(WITH_RTABMAP)
   find_package(RTABMap REQUIRED COMPONENTS core)
 endif()
 
+# CARLA-dependent executables (carla_vins_node, carla_vins_multi_node) need a
+# CARLA client SDK at a hardcoded dev-machine path, and both those plus
+# vins_bag_reader need the sibling ../global_fusion package, which does not
+# ship in every checkout (e.g. the LaneTracking robot repo). Off by default so
+# `colcon build` succeeds there; turn on with -DWITH_CARLA=ON where the CARLA
+# SDK and global_fusion are present.
+option(WITH_CARLA "Build CARLA- and global_fusion-dependent executables" OFF)
+
 
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -51,6 +64,16 @@ add_subdirectory(vins)
 add_executable(vins_fusion_ros2_node src/vins_estimator.cpp src/vins_estimator_node.cpp src/visualization.cpp)
 ament_target_dependencies(vins_fusion_ros2_node rclcpp rcpputils message_filters std_msgs visualization_msgs geometry_msgs nav_msgs tf2 tf2_ros cv_bridge image_transport)
 target_link_libraries(vins_fusion_ros2_node vins_lib)
+
+# CARLA bag -> VINS reader (refactored API). Loads a rosbag2 directly, feeds the
+# Estimator, writes <OUTPUT_FOLDER>/vio.txt, republishes images/gnss + /vins_estimator/odometry.
+# No CARLA SDK or global_fusion dependency, so this one always builds.
+add_executable(carla_bag_test src/carla_bag_test.cpp)
+ament_target_dependencies(carla_bag_test
+  rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge rosbag2_cpp rosbag2_storage)
+target_link_libraries(carla_bag_test vins_lib)
+
+if(WITH_CARLA)
 
 # Offline direct-read driver (rosbag2_cpp SequentialReader -> Estimator [+ global_fusion])
 set(GF ${CMAKE_CURRENT_SOURCE_DIR}/../global_fusion)
@@ -65,13 +88,6 @@ target_include_directories(vins_bag_reader PRIVATE
 ament_target_dependencies(vins_bag_reader
   rclcpp sensor_msgs nav_msgs geometry_msgs visualization_msgs cv_bridge rosbag2_cpp rosbag2_storage)
 target_link_libraries(vins_bag_reader vins_lib ${CERES_LIBRARIES})
-
-# CARLA bag -> VINS reader (refactored API). Loads a rosbag2 directly, feeds the
-# Estimator, writes <OUTPUT_FOLDER>/vio.txt, republishes images/gnss + /vins_estimator/odometry.
-add_executable(carla_bag_test src/carla_bag_test.cpp)
-ament_target_dependencies(carla_bag_test
-  rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge rosbag2_cpp rosbag2_storage)
-target_link_libraries(carla_bag_test vins_lib)
 
 # CARLA bag -> VINS -> RTAB-Map (direct, no ROS between them). Same VINS API as
 # carla_bag_test, plus RTAB-Map core for loop closure + GPS fusion. Opt-in.
@@ -169,6 +185,8 @@ target_link_libraries(carla_vins_multi_node
   png tiff jpeg
   Threads::Threads)
 
+endif() # WITH_CARLA
+
 # Install launch files
 install(
   DIRECTORY launch config
@@ -176,8 +194,12 @@ install(
 )
 
 # Install nodes
+set(VINS_FUSION_ROS2_INSTALL_TARGETS vins_fusion_ros2_node carla_bag_test)
+if(WITH_CARLA)
+  list(APPEND VINS_FUSION_ROS2_INSTALL_TARGETS vins_bag_reader carla_vins_node carla_vins_multi_node)
+endif()
 install(
-  TARGETS vins_fusion_ros2_node vins_bag_reader carla_bag_test carla_vins_node carla_vins_multi_node
+  TARGETS ${VINS_FUSION_ROS2_INSTALL_TARGETS}
   DESTINATION lib/${PROJECT_NAME}
 )
 ament_package()

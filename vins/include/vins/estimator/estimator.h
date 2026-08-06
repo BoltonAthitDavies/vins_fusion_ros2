@@ -31,6 +31,7 @@
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <opencv2/core/eigen.hpp>
