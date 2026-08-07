@@ -1,2 +1,5 @@
 # Ignore PDF files in config directory
 config/*.pdf
+
+# Ignore dataset directory
+dataset/
