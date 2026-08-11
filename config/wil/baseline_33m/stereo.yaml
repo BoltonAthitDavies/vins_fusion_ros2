@@ -33,9 +33,8 @@ use_gpu_ceres: 0
 # configs (cam x-right/y-down/z-forward -> body x-forward/y-left/z-up).
 # body_T_cam1 = body_T_cam0 * cam0_T_cam1, where cam0_T_cam1 is the inverse of the
 # calibrated (R, T) that maps cam0-frame points into cam1-frame points, i.e.
-# cam0_T_cam1.R = R^T, cam0_T_cam1.t = -R^T @ T. Baseline is ~9.36cm with a ~1.09deg
+# cam0_T_cam1.R = R^T, cam0_T_cam1.t = -R^T @ T. Baseline is ~3.15cm with a ~1.3deg
 # relative rotation between the two cameras (a real, slightly non-parallel rig).
-# (Older ~3.15cm/33mm-baseline calibration archived in config/wil/baseline_33m/.)
 estimate_extrinsic: 0
 
 body_T_cam0: !!opencv-matrix
@@ -51,9 +50,9 @@ body_T_cam1: !!opencv-matrix
    rows: 4
    cols: 4
    dt: d
-   data: [-0.0112430044,  0.0137423283,  0.9998423592,  0.0003943868,
-          -0.9999155119, -0.0066784035, -0.0111520357, -0.0935980368,
-           0.0065240958, -0.9998832669,  0.0138162526,  0.0010121732,
+   data: [ 0.0222955695, -0.0203024087,  0.9995452565,  0.0000794828,
+          -0.9997505246,  0.0008874595,  0.0223181739,  0.0315311332,
+          -0.0013401687, -0.9997934910, -0.0202775573, -0.0005400126,
            0.0,            0.0,           0.0,           1.0]
 
 # Feature tracker
