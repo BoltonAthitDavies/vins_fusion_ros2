@@ -21,12 +21,27 @@ IMUData fromMsg(const sensor_msgs::msg::Imu &msg) {
   return imu;
 }
 
+namespace {
+// True when the buffer holds exactly one byte per pixel, regardless of what the
+// encoding field claims. The WiL cameras publish CompressedImage with format
+// "yuv422; jpeg compressed mono8": the JPEG payload is single-channel, but
+// image_transport's `republish` stamps the *original* encoding ("yuv422", 2 bytes
+// per pixel) onto the decoded image. cv_bridge then rejects it with
+// "step < width * byte_depth * num_channels". The row stride is the ground truth.
+bool isSingleBytePerPixel(const sensor_msgs::msg::Image &m) {
+  return m.width > 0 && m.height > 0 && m.step == m.width &&
+         m.data.size() == static_cast<size_t>(m.step) * m.height;
+}
+}  // namespace
+
 cv::Mat fromMsg(const sensor_msgs::msg::Image &img_msg) {
   cv_bridge::CvImageConstPtr cv_ptr;
 
   try {
-    // 处理非标准编码 "8UC1"，转为 "mono8"
-    if (img_msg.encoding == "8UC1") {
+    // 处理非标准编码 "8UC1"，以及编码字段与实际步长不符的情况，转为 "mono8"
+    if (img_msg.encoding == "8UC1" ||
+        (img_msg.encoding != sensor_msgs::image_encodings::MONO8 &&
+         isSingleBytePerPixel(img_msg))) {
       sensor_msgs::msg::Image converted_msg = img_msg;
       converted_msg.encoding = sensor_msgs::image_encodings::MONO8;
       cv_ptr = cv_bridge::toCvCopy(converted_msg,

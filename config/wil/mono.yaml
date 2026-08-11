@@ -1,0 +1,102 @@
+%YAML:1.0
+
+# MONO + IMU (imu:1, num_of_cam:1). WiL rig, cam0 only.
+#
+# WHY imu MUST be 1 HERE:
+#   Estimator::processInitialization (vins/src/estimator/estimator.cpp:458) dispatches
+#   exactly three modes -- isMonoWithImu(), isStereoWithImu(), isStereoWithoutImu().
+#   A mono setup with imu:0 matches none of them, so the estimator never runs an
+#   initializer and never leaves SolverState::INITIAL. Mono-without-IMU is also
+#   unobservable in scale in principle. Do not set imu:0 in this file.
+#
+# BEFORE THIS CONFIG CAN RUN -- REQUIRED HARDWARE CHANGE:
+#   The rig's only IMU topic today is /hwt101ct_yaw_publisher, and it carries
+#   orientation ONLY. Inspected over the recorded bag, every sample has
+#   linear_acceleration == (0,0,0), angular_velocity == (0,0,0), and
+#   linear_acceleration_covariance[0] == -1 (the ROS "field unavailable" flag).
+#   The HWT101CT is a single-axis yaw module, not a 6-axis IMU. VINS pre-integrates
+#   raw accel + gyro, so with that topic initialization cannot succeed -- expect
+#   NaN residuals rather than a clean failure.
+#   => Point imu_topic at a real 6-axis IMU publishing sensor_msgs/Imu with
+#      populated linear_acceleration and angular_velocity, then fill in the noise
+#      values and body_T_cam0 below from an actual calibration.
+#
+# Until that IMU exists, config/wil/stereo.yaml is the mode this rig can actually run.
+imu: 1
+num_of_cam: 1
+
+# TODO: replace with the real 6-axis IMU topic. /hwt101ct_yaw_publisher will NOT work
+# (orientation-only; see the note above).
+imu_topic: "/imu0"
+
+# The node subscribes as sensor_msgs/Image, while the camera publishes
+# sensor_msgs/CompressedImage on .../image_raw/compressed. Decompress first:
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam0/image_raw/compressed -r out:=/cam0/image_raw
+image0_topic: "/cam0/image_raw"
+image1_topic: "/cam1/image_raw"    # unused with num_of_cam:1, kept for parity
+
+output_path: "/home/ambushee/output/wil_mono/"   # absolute: "~" is NOT expanded by ofstream
+
+cam0_calib: "cam0_fisheye.yaml"
+image_width: 1920
+image_height: 1080
+
+use_gpu: 0
+use_gpu_acc_flow: 0
+use_gpu_ceres: 0
+
+# Extrinsics.
+# In mono+IMU mode the body frame is the IMU frame, so body_T_cam0 is the
+# IMU -> cam0 transform. That is NOT the same quantity as in stereo.yaml, where cam0
+# was treated as the body origin -- do not copy the stereo value across as if it were
+# calibrated. No IMU-camera calibration exists for this rig yet, so the matrix below is
+# only the camera-optical -> body axis convention (cam x-right/y-down/z-forward ->
+# body x-forward/y-left/z-up) with zero translation, i.e. a rough guess.
+# estimate_extrinsic:1 tells VINS to treat it as an initial guess and optimize it
+# online. Once you have a real IMU-camera calibration, put it here and set this to 0.
+estimate_extrinsic: 1
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  0.0,
+          -1.0,  0.0,  0.0,  0.0,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+# Feature tracker.
+# Mono carries no per-frame stereo depth, so the sliding window leans harder on
+# temporal parallax: more features and a lower keyframe threshold than stereo.yaml.
+multiple_thread: 1
+image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
+max_cnt: 200
+min_dist: 30
+freq: 20
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+# Optimization
+max_solver_time: 0.08
+max_num_iterations: 100
+keyframe_parallax: 10.0
+
+# IMU noise -- placeholders carried over from stereo.yaml (Bosch BNO055).
+# TODO: re-measure these for whichever 6-axis IMU actually gets fitted. Mono+IMU is far
+# more sensitive to these than stereo is, because scale comes entirely from the IMU.
+acc_n: 0.00147
+gyr_n: 0.000244
+acc_w: 0.0005
+gyr_w: 0.00002
+g_norm: 9.81007
+
+# Online time-offset estimation between camera and IMU. Worth having on for a rig whose
+# camera and IMU are not hardware-triggered together.
+estimate_td: 1
+td: 0.0
+
+load_previous_pose_graph: 0
+pose_graph_save_path: "/home/ambushee/output/wil_mono/pose_graph/"
+save_image: 1

@@ -7,8 +7,15 @@ imu: 0
 num_of_cam: 2
 
 imu_topic: "/imu0"                    # unused while imu:0; real yaw sensor topic is /hwt101ct_yaw_publisher
-image0_topic: "/cam0/image_raw"       # matches robot_camera/launch/dual_camera.launch.py (v4l2_camera_node, namespace cam0)
-image1_topic: "/cam1/image_raw"       # matches robot_camera/launch/dual_camera.launch.py (v4l2_camera_node, namespace cam1)
+# The node subscribes as sensor_msgs/Image (see vins_estimator.cpp), while the camera /
+# bag publishes sensor_msgs/CompressedImage on .../image_raw/compressed. Run two
+# image_transport republish nodes to decompress into these raw topics:
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam0/image_raw/compressed -r out:=/cam0/image_raw
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam1/image_raw/compressed -r out:=/cam1/image_raw
+image0_topic: "/cam0/image_raw"
+image1_topic: "/cam1/image_raw"
 output_path: "~/output/wil_stereo/"
 
 cam0_calib: "cam0_fisheye.yaml"

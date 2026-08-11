@@ -17,6 +17,20 @@ if(EXISTS "$ENV{HOME}/local_ocv/lib/cmake/opencv4")
   set(OpenCV_DIR $ENV{HOME}/local_ocv/lib/cmake/opencv4 CACHE PATH "" FORCE)
 endif()
 
+# This package uses the Ceres Manifold API (ceres::Manifold, QuaternionManifold),
+# which needs Ceres >= 2.1. Ubuntu 22.04's apt libceres-dev is 2.0.0 and only has
+# the older LocalParameterization, so a source-built Ceres 2.2 in ~/local takes
+# precedence when present. Same fallback shape as the OpenCV block above: on
+# machines without it, find_package(Ceres) below picks up the system install.
+if(EXISTS "$ENV{HOME}/local/lib/cmake/Ceres")
+  set(Ceres_DIR $ENV{HOME}/local/lib/cmake/Ceres CACHE PATH "" FORCE)
+endif()
+
+# The Ceres above lives outside the default linker search path, so bake its
+# directory into the installed binaries' RPATH -- otherwise they build fine but
+# fail at launch with "libceres.so.X: cannot open shared object file".
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
