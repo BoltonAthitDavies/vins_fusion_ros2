@@ -82,6 +82,11 @@ target_link_libraries(vins_fusion_ros2_node vins_lib)
 # CARLA bag -> VINS reader (refactored API). Loads a rosbag2 directly, feeds the
 # Estimator, writes <OUTPUT_FOLDER>/vio.txt, republishes images/gnss + /vins_estimator/odometry.
 # No CARLA SDK or global_fusion dependency, so this one always builds.
+# Relabels mislabelled single-channel Image messages as mono8 (the "yuv422; jpeg
+# compressed mono8" camera format defeats every cv_bridge consumer). See the file header.
+add_executable(image_encoding_fixer src/image_encoding_fixer.cpp)
+ament_target_dependencies(image_encoding_fixer rclcpp sensor_msgs)
+
 add_executable(carla_bag_test src/carla_bag_test.cpp)
 ament_target_dependencies(carla_bag_test
   rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge rosbag2_cpp rosbag2_storage)
@@ -208,7 +213,7 @@ install(
 )
 
 # Install nodes
-set(VINS_FUSION_ROS2_INSTALL_TARGETS vins_fusion_ros2_node carla_bag_test)
+set(VINS_FUSION_ROS2_INSTALL_TARGETS vins_fusion_ros2_node carla_bag_test image_encoding_fixer)
 if(WITH_CARLA)
   list(APPEND VINS_FUSION_ROS2_INSTALL_TARGETS vins_bag_reader carla_vins_node carla_vins_multi_node)
 endif()

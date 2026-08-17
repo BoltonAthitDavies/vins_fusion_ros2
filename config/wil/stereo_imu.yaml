@@ -1,0 +1,163 @@
+%YAML:1.0
+
+# STEREO + IMU (imu:1, num_of_cam:2). WiL rig.
+#
+# This is the most robust of the three modes VINS supports
+# (Estimator::processInitialization, vins/src/estimator/estimator.cpp:458). Stereo
+# supplies metric scale from the baseline, so unlike mono the IMU is an improvement
+# rather than a requirement -- but it adds high-rate motion between frames, makes
+# roll/pitch observable against gravity, and carries the estimate through the
+# low-texture stretches where pure stereo tracking degrades.
+#
+# IMU STATUS: a real 6-axis unit (RealSense) is now fitted and publishing on the
+# /hwt101ct_yaw_publisher topic name inherited from the old yaw-only module. Verified
+# against dataset/rosbag_realsense_imu_cambaseline95mm (2026-08-14):
+#   - linear_acceleration and angular_velocity both populated, covariances valid
+#   - 199.5 Hz, frame_id "imu_link"
+#   - good excitation for initialization: wheel velocity reaches +/-1.29 m/s and
+#     gyro.z peaks at 1.29 rad/s over the run
+#
+# OUTSTANDING -- ACCELEROMETER SCALE ERROR:
+#   With the robot stationary the accelerometer magnitude reads 9.2642 m/s^2 (std 0.030)
+#   where true gravity is ~9.81 -- a consistent 5.6% shortfall, steady across the whole
+#   bag (9.2642 at the start, 9.2610 at the end), so it is a calibration error and not
+#   noise. RealSense IMUs ship uncalibrated; run rs-imu-calibration.py and write the
+#   result to the device. Until then g_norm below is set to the OBSERVED magnitude so
+#   VINS's gravity alignment is at least self-consistent -- see the note there.
+imu: 1
+num_of_cam: 2
+
+imu_topic: "/hwt101ct_yaw_publisher"
+
+# The node subscribes as sensor_msgs/Image (see vins_estimator.cpp), while the camera /
+# bag publishes sensor_msgs/CompressedImage on .../image_raw/compressed. Run two
+# image_transport republish nodes to decompress into these raw topics:
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam0/image_raw/compressed -r out:=/cam0/image_raw
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam1/image_raw/compressed -r out:=/cam1/image_raw
+image0_topic: "/cam0/image_raw"
+image1_topic: "/cam1/image_raw"
+
+output_path: "/home/ambushee/output/wil_stereo_imu/"   # absolute: "~" is NOT expanded by ofstream
+
+cam0_calib: "cam0_fisheye.yaml"
+cam1_calib: "cam1_fisheye.yaml"
+image_width: 1920
+image_height: 1080
+
+use_gpu: 0
+use_gpu_acc_flow: 0
+use_gpu_ceres: 0
+
+# Extrinsics.
+#
+# IMPORTANT -- the body frame MOVES when imu goes 0 -> 1. In stereo.yaml (imu:0) cam0 is
+# the body origin, so body_T_cam0 is just the camera-optical -> body axis convention.
+# With an IMU the body frame IS the IMU frame, so both matrices below must be
+# IMU -> camera transforms. They are different quantities despite the identical names.
+#
+# ROTATION -- measured from the data, not assumed. Averaging the stationary window of
+# dataset/rosbag_realsense_imu_cambaseline95mm gives an "up" direction in the IMU frame
+# of (+0.029, -0.997, -0.075): gravity lies almost entirely on -Y, so the IMU's +Y axis
+# points DOWN. That is the RealSense convention, x-right / y-down / z-forward, which is
+# the SAME convention as a camera optical frame. So the IMU -> cam0 rotation is
+# approximately IDENTITY, and body_T_cam0 below is set accordingly.
+#
+# Note this is a real correction, not a cosmetic one: stereo.yaml's matrix rotates
+# camera-optical into an x-forward/y-left/z-up body frame, which was right when cam0 WAS
+# the body origin but is ~90deg wrong now that the body frame is the IMU. Seeding
+# estimate_extrinsic:1 with a 90deg error would likely stop it converging at all.
+# (The residual (+0.029, -, -0.075) is mounting tilt: the unit sits ~4.3deg in pitch and
+# ~1.7deg in roll off level. That is rig tilt, not a frame convention, so it is left for
+# the online refinement rather than baked into the matrix.)
+#
+# TRANSLATION -- still a placeholder. Zero asserts the IMU sits exactly at cam0's
+# optical centre, which it does not. The lever arm couples angular rate into measured
+# acceleration, so leaving it at zero injects a systematic error during turns, and this
+# run reaches 1.29 rad/s of yaw rate. Even a tape-measured offset beats zero.
+#
+# body_T_cam1 = body_T_cam0 * cam0_T_cam1, recomputed for the new body frame. Since
+# body_T_cam0 is now identity, body_T_cam1 IS the calibrated stereo relative
+# (cam0_T_cam1 = inv(old body_T_cam0) * old body_T_cam1). The calibration is unchanged
+# and still checks out: 0.093604 m baseline, 1.0854 deg relative rotation, with the
+# translation on camera +X as a stereo pair should have.
+#
+# TODO before trusting results: calibrate IMU -> cam0 with Kalibr, write it into
+# body_T_cam0, recompute body_T_cam1 = body_T_cam0 * cam0_T_cam1, set
+# estimate_extrinsic to 0.
+#
+# estimate_extrinsic:1 = treat the matrices as an initial guess and refine online.
+# Right setting while the lever arm is a guess, but it also re-optimizes the
+# well-calibrated stereo relative. If the baseline drifts away from 9.36cm in
+# extrinsic_parameter.csv, calibrate properly and go back to 0.
+estimate_extrinsic: 1
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 1.0,  0.0,  0.0,  0.0,
+           0.0,  1.0,  0.0,  0.0,
+           0.0,  0.0,  1.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.9999155119,  0.0066784035,  0.0111520357,  0.0935980368,
+          -0.0065240958,  0.9998832669, -0.0138162526, -0.0010121732,
+          -0.0112430044,  0.0137423283,  0.9998423592,  0.0003943868,
+           0.0,           0.0,           0.0,           1.0]
+
+# Feature tracker
+multiple_thread: 1
+image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
+max_cnt: 150
+min_dist: 30
+freq: 20
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+# Optimization.
+# keyframe_parallax raised from stereo.yaml's 5.0: IMU pre-integration bridges the gap
+# between keyframes, so keyframes can be sparser without losing the motion in between.
+max_solver_time: 0.08
+max_num_iterations: 100
+keyframe_parallax: 10.0
+
+# IMU noise. These set how strongly the optimizer trusts the IMU against visual
+# reprojection, and they are live now that imu:1.
+# Values taken from this repo's own config/realsense_d435i/realsense_stereo_imu_config.yaml
+# rather than stereo.yaml's Bosch BNO055 figures, which were ~68x too tight for a
+# RealSense (acc_n 0.00147 vs 0.1) and would have made the optimizer badly over-trust
+# an IMU that is currently 5.6% out on scale.
+# TODO: re-derive properly with an Allan variance plot from several hours of stationary
+# logging (imu_utils / allan_variance_ros). Until then these are deliberately loose --
+# too-large noise degrades gracefully toward stereo-only, too-small does not.
+acc_n: 0.1              # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+gyr_n: 0.01             # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+acc_w: 0.001            # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
+gyr_w: 0.0001           # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
+
+# NOT the true local gravity (~9.81). This is the magnitude the accelerometer actually
+# reports at rest, 9.2642 m/s^2, measured over the stationary window of the 2026-08-14
+# bag. VINS uses g_norm as a fixed constraint when it refines gravity during
+# initialization; feeding it 9.81 while the sensor insists on 9.264 makes that step
+# inconsistent and is a good way to get a failed or badly-scaled init.
+# This is a WORKAROUND for the uncalibrated accelerometer, not a fix -- the 5.6% scale
+# error still corrupts dynamic accelerations, where bias estimation only partly absorbs
+# it. Run rs-imu-calibration.py, then set this back to 9.81007.
+g_norm: 9.2642          # observed, see note above
+
+# Online camera/IMU time-offset estimation. Worth having on for a rig where the camera
+# and IMU are not hardware-triggered together, which is the case here (separate USB
+# camera nodes and a serial IMU).
+estimate_td: 1
+td: 0.0
+
+load_previous_pose_graph: 0
+pose_graph_save_path: "/home/ambushee/output/wil_stereo_imu/pose_graph/"
+save_image: 1
