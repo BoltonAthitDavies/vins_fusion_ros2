@@ -1,0 +1,32 @@
+%YAML:1.0
+---
+# Gazebo Fortress camera sensor "cam0" on the ackermann_robot
+# (aws-robomaker-small-warehouse-world/models/ackermann_robot/model.sdf).
+#
+# Derived from the sensor's own SDF, not from a calibration run -- a gz camera is
+# an ideal pinhole with square pixels and the principal point exactly at the
+# image centre, so the intrinsics follow from <image> and <horizontal_fov> alone:
+#   fx = fy = (width/2) / tan(hfov/2) = 640 / tan(45 deg) = 640
+#   cx, cy = width/2, height/2 = 640, 360
+#   all distortion terms = 0
+#
+# These numbers are only valid while model.sdf says 1280x720 at
+# horizontal_fov 1.5707963268. Change either there and this file must change too.
+#
+# NOT interchangeable with config/wil/cam0_fisheye.yaml: the real rig runs a
+# ~180 deg KANNALA_BRANDT fisheye at 1920x1080, which Fortress cannot render at
+# all (gz-sensors 6 ships no wide-angle camera implementation).
+model_type: PINHOLE
+camera_name: cam0
+image_width: 1280
+image_height: 720
+distortion_parameters:
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+projection_parameters:
+   fx: 640.0
+   fy: 640.0
+   cx: 640.0
+   cy: 360.0

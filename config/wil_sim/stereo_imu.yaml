@@ -1,0 +1,141 @@
+%YAML:1.0
+
+# STEREO + IMU (imu:1, num_of_cam:2). SIMULATED WiL rig, Gazebo Fortress.
+#
+# The sensors are defined in
+#   aws-robomaker-small-warehouse-world/models/ackermann_robot/model.sdf
+# and reach ROS through the ros_gz_bridge started by that package's
+# launch/small_warehouse.launch.py. Bring the whole thing up with:
+#   ros2 launch aws_robomaker_small_warehouse_world small_warehouse.launch.py
+#
+# This is the SIM twin of config/wil/stereo_imu.yaml. The tuning is carried over,
+# but every number describing the hardware is different, because the simulated
+# rig genuinely is a different rig:
+#
+#   - Cameras are ideal PINHOLE, not fisheye. Fortress ships no wide-angle camera
+#     implementation, so the real rig's ~180 deg KANNALA_BRANDT lens cannot be
+#     reproduced. Anything that depends on that FOV -- feature distribution at
+#     the image edge, the KANNALA_BRANDT unprojection path -- is NOT exercised
+#     here. Use recorded bags with config/wil/ for that.
+#   - The IMU reports in ROS REP-103 axes (x-forward, y-left, z-up), where the
+#     real RealSense reports x-right/y-down/z-forward. That is the whole reason
+#     body_T_cam0 below is a rotation matrix rather than the near-identity one in
+#     config/wil/stereo_imu.yaml.
+#   - Simulated gravity is exactly 9.8 and the accelerometer has no scale error,
+#     so the g_norm workaround in config/wil/ does not apply.
+#
+# Sim advantages worth using: the extrinsics are exact (estimate_extrinsic:0),
+# there is no camera/IMU time offset (estimate_td:0), and Gazebo publishes
+# ground-truth odometry to check the trajectory against.
+imu: 1
+num_of_cam: 2
+
+# Bridged straight through from gz. No image_transport republish step is needed
+# here -- unlike the real rig, gz publishes raw images, not CompressedImage.
+imu_topic: "/imu"
+image0_topic: "/cam0/image_raw"
+image1_topic: "/cam1/image_raw"
+
+output_path: "/home/ambushee/output/wil_sim_stereo_imu/"   # absolute: "~" is NOT expanded by ofstream
+
+cam0_calib: "cam0_pinhole.yaml"
+cam1_calib: "cam1_pinhole.yaml"
+image_width: 1280
+image_height: 720
+
+use_gpu: 0
+use_gpu_acc_flow: 0
+use_gpu_ceres: 0
+
+# Extrinsics.
+#
+# The body frame is the IMU frame. In sim both the IMU pose and the camera poses
+# are exact model geometry, so these matrices are computed, not calibrated, and
+# estimate_extrinsic is 0 -- there is nothing to refine and letting VINS
+# re-optimize would only add noise.
+#
+# ROTATION. imu_link carries no rotation relative to base_link, so the body frame
+# is REP-103 (x-forward, y-left, z-up) and the cameras are REP-104 optical
+# (x-right, y-down, z-forward). That gives the fixed
+#   body_R_cam = [[0,0,1],[-1,0,0],[0,-1,0]]
+# for both cameras -- the same matrix as config/carla/carla_stereo_imu.yaml,
+# which faces the identical situation.
+#
+# TRANSLATION. Camera origin minus IMU origin, in the body frame. From the
+# base_footprint-relative poses in model.sdf:
+#   imu_link  (0.338,  0,      0.192)
+#   cam0      (0.496,  0,      0.4395)
+#   cam1      (0.496, -0.0936, 0.4395)
+# giving (0.158, 0, 0.2475) and (0.158, -0.0936, 0.2475). Note this is a real
+# 0.25 m lever arm, so unlike config/wil/'s zeroed placeholder it correctly
+# accounts for angular rate coupling into measured acceleration during turns.
+#
+# The 0.0936 m baseline is the real rig's calibrated 93.598 mm, reused verbatim
+# so sim and hardware geometry agree.
+#
+# If stereo geometry ever looks wrong, check the SIGN of cam1's y translation
+# first -- it is the classic failure. cam1 is the RIGHT camera, so in a
+# y-left body frame its offset is negative. Cross-check by eye: in rqt_image_view
+# the cam1 image should be shifted LEFT relative to cam0.
+estimate_extrinsic: 0
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0,  0,  1,  0.158,
+          -1,  0,  0,  0.0,
+           0, -1,  0,  0.2475,
+           0,  0,  0,  1]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0,  0,  1,  0.158,
+          -1,  0,  0, -0.0936,
+           0, -1,  0,  0.2475,
+           0,  0,  0,  1]
+
+# Feature tracker
+multiple_thread: 1
+image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
+max_cnt: 150
+min_dist: 30
+freq: 20
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+# Optimization. Same as config/wil/: IMU pre-integration bridges the gap between
+# keyframes, so keyframes can be sparser without losing the motion in between.
+max_solver_time: 0.08
+max_num_iterations: 100
+keyframe_parallax: 10.0
+
+# IMU noise. Unlike the real rig these have a known ground truth: model.sdf
+# declares the sensor with the standard ADIS16448 densities,
+#   gyro  0.0003394 rad/s/sqrt(Hz),  random walk 3.8785e-05
+#   accel 0.004     m/s^2/sqrt(Hz),  random walk 0.006
+# (expressed there as per-sample stddev, i.e. density * sqrt(200 Hz)).
+# Set a few times looser than truth, per the usual VINS advice -- too-large noise
+# degrades gracefully toward stereo-only, too-small does not.
+acc_n: 0.02             # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+gyr_n: 0.002            # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+acc_w: 0.001            # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
+gyr_w: 0.0001           # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
+
+# Exactly the worlds' <gravity>0 0 -9.8</gravity>. The simulated accelerometer
+# has no scale error, so this is true gravity and not the observed-magnitude
+# workaround config/wil/stereo_imu.yaml has to use.
+g_norm: 9.8
+
+# Off, and correctly so: the gz camera and IMU sensors are both stamped from the
+# same simulation clock, so there is no offset to estimate. Leaving it on would
+# have VINS chase a parameter whose true value is zero.
+estimate_td: 0
+td: 0.0
+
+load_previous_pose_graph: 0
+pose_graph_save_path: "/home/ambushee/output/wil_sim_stereo_imu/pose_graph/"
+save_image: 1
