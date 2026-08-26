@@ -31,9 +31,21 @@ void VinsEstimator::initializeParamters() {
   if (!output_path.empty()) {
     options->OUTPUT_FOLDER = output_path;
     options->VINS_RESULT_PATH = output_path + "/vio.csv";
+    options->POSE_GRAPH_SAVE_PATH = output_path + "/pose_graph/";
     std::ofstream(options->VINS_RESULT_PATH, std::ios::out);  // truncate/create fresh
     RCLCPP_INFO(this->get_logger(), "output_path override -> %s",
                 options->VINS_RESULT_PATH.c_str());
+  }
+
+  // Optional ROS param "pose_graph_save_path" wins over both the config value and
+  // the output_path-derived default above, so a run can point its pose graph
+  // somewhere other than its vio.csv. Empty = keep whatever was resolved already.
+  auto pose_graph_save_path =
+      readParam<std::string>(this, "pose_graph_save_path", "");
+  if (!pose_graph_save_path.empty()) {
+    options->POSE_GRAPH_SAVE_PATH = pose_graph_save_path;
+    RCLCPP_INFO(this->get_logger(), "pose_graph_save_path override -> %s",
+                options->POSE_GRAPH_SAVE_PATH.c_str());
   }
 
   estimator_->initialize(options);

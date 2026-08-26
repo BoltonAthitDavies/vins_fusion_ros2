@@ -58,6 +58,7 @@ struct VINSOptions {
   std::string EX_CALIB_RESULT_PATH;
   std::string VINS_RESULT_PATH;
   std::string OUTPUT_FOLDER;
+  std::string POSE_GRAPH_SAVE_PATH;
   //////////////////////////////////////////////////////////////////////////////
   double solver_time = 0.0;
   int max_iterations = 0;
@@ -124,6 +125,12 @@ struct VINSOptions {
     VINS_INFO << "result path " << this->VINS_RESULT_PATH;
     std::ofstream fout(this->VINS_RESULT_PATH, std::ios::out);
     fout.close();
+
+    // Optional key: fall back to a subdirectory of the output folder so a config
+    // may omit it entirely. An empty FileNode leaves the string empty.
+    fsSettings["pose_graph_save_path"] >> this->POSE_GRAPH_SAVE_PATH;
+    if (this->POSE_GRAPH_SAVE_PATH.empty())
+      this->POSE_GRAPH_SAVE_PATH = this->OUTPUT_FOLDER + "/pose_graph/";
 
     this->extrinsic_estimation_mode = static_cast<ExtrinsicEstimationMode>(
         (int)fsSettings["estimate_extrinsic"]);

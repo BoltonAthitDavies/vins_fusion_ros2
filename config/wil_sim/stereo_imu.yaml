@@ -64,19 +64,27 @@ use_gpu_ceres: 0
 # TRANSLATION. Camera origin minus IMU origin, in the body frame. From the
 # base_footprint-relative poses in model.sdf:
 #   imu_link  (0.338,  0,      0.192)
-#   cam0      (0.496,  0,      0.4395)
-#   cam1      (0.496, -0.0936, 0.4395)
-# giving (0.158, 0, 0.2475) and (0.158, -0.0936, 0.2475). Note this is a real
+#   cam0      (0.496,  0.0936, 0.4395)
+#   cam1      (0.496,  0,      0.4395)
+# giving (0.158, 0.0936, 0.2475) and (0.158, 0, 0.2475). Note this is a real
 # 0.25 m lever arm, so unlike config/wil/'s zeroed placeholder it correctly
 # accounts for angular rate coupling into measured acceleration during turns.
+#
+# CAM1 IS THE CENTRED CAMERA. It sits on the robot centreline (body y = 0) and
+# cam0 is the offset one, one baseline to its left (body +Y). That is why cam0's
+# y is positive here and cam1's is zero -- it is not a typo, and it is the
+# opposite of the naive "cam0 is the reference so cam0 is centred" layout.
 #
 # The 0.0936 m baseline is the real rig's calibrated 93.598 mm, reused verbatim
 # so sim and hardware geometry agree.
 #
-# If stereo geometry ever looks wrong, check the SIGN of cam1's y translation
-# first -- it is the classic failure. cam1 is the RIGHT camera, so in a
-# y-left body frame its offset is negative. Cross-check by eye: in rqt_image_view
-# the cam1 image should be shifted LEFT relative to cam0.
+# If stereo geometry ever looks wrong, check the stereo RELATIVE rather than
+# either column on its own -- that is the quantity VINS actually triangulates
+# with, and it is invariant to where the pair sits on the chassis:
+#   cam0_T_cam1 = inv(body_T_cam0) * body_T_cam1  ->  +0.0936 on cam0's optical X
+# Positive optical X means cam1 is the RIGHT camera, matching the hardware
+# calibration in config/wil/camera1_rot_trans.dat. Cross-check by eye: in
+# rqt_image_view the cam1 image should be shifted LEFT relative to cam0.
 estimate_extrinsic: 0
 
 body_T_cam0: !!opencv-matrix
@@ -84,7 +92,7 @@ body_T_cam0: !!opencv-matrix
    cols: 4
    dt: d
    data: [ 0,  0,  1,  0.158,
-          -1,  0,  0,  0.0,
+          -1,  0,  0,  0.0936,
            0, -1,  0,  0.2475,
            0,  0,  0,  1]
 
@@ -93,7 +101,7 @@ body_T_cam1: !!opencv-matrix
    cols: 4
    dt: d
    data: [ 0,  0,  1,  0.158,
-          -1,  0,  0, -0.0936,
+          -1,  0,  0,  0.0,
            0, -1,  0,  0.2475,
            0,  0,  0,  1]
 
