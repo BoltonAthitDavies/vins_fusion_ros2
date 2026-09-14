@@ -44,8 +44,11 @@ class FeatureTracker {
  public:
   FeatureTracker();
   void setOptions(std::shared_ptr<VINSOptions> options_);
+  /// _dynamic_mask is optional: CV_8UC1, same size as _img, 255 = static/keep,
+  /// 0 = dynamic. Empty disables filtering and reproduces stock behaviour.
   map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> trackImage(
-      double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
+      double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat(),
+      const cv::Mat &_dynamic_mask = cv::Mat());
   void setMask();
   void addPoints();
   void readIntrinsicParameter(const vector<string> &calib_file);
@@ -72,6 +75,12 @@ class FeatureTracker {
   int row, col;
   cv::Mat imTrack;
   cv::Mat mask;
+  /// Dynamic-object mask for the CURRENT frame, in image0 coordinates. Latched by
+  /// trackImage, consumed by setMask. Empty = no filtering.
+  cv::Mat dynamic_mask;
+  /// Tracked points dropped so far because they drifted onto a dynamic region.
+  /// Diagnostic only; the node logs it so a run that filtered nothing is visible.
+  size_t dynamic_dropped = 0;
   cv::Mat fisheye_mask;
   cv::Mat prev_img, cur_img;
   vector<cv::Point2f> n_pts;

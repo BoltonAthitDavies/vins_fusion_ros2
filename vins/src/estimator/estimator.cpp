@@ -107,10 +107,11 @@ void Estimator::inputImage(const ImageData &image) {
   TicToc featureTrackerTime;
 
   if (image.image1.empty()) {
-    featureFrame = featureTracker.trackImage(image.timestamp, image.image0);
+    featureFrame = featureTracker.trackImage(image.timestamp, image.image0,
+                                             cv::Mat(), image.mask);
   } else {
-    featureFrame =
-        featureTracker.trackImage(image.timestamp, image.image0, image.image1);
+    featureFrame = featureTracker.trackImage(image.timestamp, image.image0,
+                                             image.image1, image.mask);
   }
   if (options->shouldShowTrack()) {
     track_image.image0 = featureTracker.getTrackImage();

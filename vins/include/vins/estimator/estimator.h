@@ -50,6 +50,14 @@ class Estimator {
   void inputIMU(const IMUData &imu);
   void inputFeature(Timestamp timestamp, const FeatureFrame &featureFrame);
   void inputImage(const ImageData &image);
+
+  /// Tracked points dropped so far because they landed on a dynamic region.
+  /// featureTracker is private, and this is the only thing the node needs from
+  /// it -- proof that the masks are actually removing features, not just
+  /// arriving. Zero after a run with filter:=true means the mask never bit.
+  std::size_t dynamicDroppedPoints() const {
+    return featureTracker.dynamic_dropped;
+  }
   //
   void processMeasurements();
   //

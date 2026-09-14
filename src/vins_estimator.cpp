@@ -1,7 +1,10 @@
 #include <cv_bridge/cv_bridge.h>
 #include <vins_fusion_ros2/vins_estimator.h>
 
+#include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <opencv2/imgproc.hpp>
 
 VinsEstimator::VinsEstimator() : rclcpp::Node("vins_estimator") {
   options = std::make_shared<VINSOptions>();
@@ -10,7 +13,41 @@ VinsEstimator::VinsEstimator() : rclcpp::Node("vins_estimator") {
   initialize();
 }
 
-VinsEstimator::~VinsEstimator() {}
+void VinsEstimator::reportFilter() {
+  RCLCPP_INFO(this->get_logger(),
+              "dynamic filter: %zu frames masked, %zu with no recent detection, "
+              "%zu tracked points dropped onto dynamic regions, %zu masks "
+              "discarded for exceeding max_mask_fraction",
+              det_matched_, det_missed_, estimator_->dynamicDroppedPoints(),
+              mask_rejected_);
+  if (det_matched_ == 0) {
+    RCLCPP_WARN(this->get_logger(),
+                "filter is ON but NOT ONE frame has matched a detection. Is the "
+                "detector node running, and is det_max_age (%.0f ms) long enough "
+                "for its inference time?",
+                det_max_age_ * 1e3);
+  }
+}
+
+VinsEstimator::~VinsEstimator() {
+  if (!filter_) return;
+  RCLCPP_INFO(this->get_logger(),
+              "dynamic filter: %zu frames masked, %zu with no recent detection, "
+              "%zu tracked points dropped onto dynamic regions",
+              det_matched_, det_missed_, estimator_->dynamicDroppedPoints());
+  if (det_matched_ == 0) {
+    RCLCPP_WARN(this->get_logger(),
+                "filter was ON but NOT ONE frame matched a detection. Is the "
+                "detector node running, and is det_max_age (%.0f ms) long enough "
+                "for its inference time?",
+                det_max_age_ * 1e3);
+  }
+  if (mask_rejected_ > 0) {
+    RCLCPP_WARN(this->get_logger(),
+                "discarded %zu masks for exceeding max_mask_fraction",
+                mask_rejected_);
+  }
+}
 
 void VinsEstimator::initialize() {
   initializeParamters();
@@ -46,6 +83,34 @@ void VinsEstimator::initializeParamters() {
     options->POSE_GRAPH_SAVE_PATH = pose_graph_save_path;
     RCLCPP_INFO(this->get_logger(), "pose_graph_save_path override -> %s",
                 options->POSE_GRAPH_SAVE_PATH.c_str());
+  }
+
+  // --- dynamic object detection (RY-SLAM) -----------------------------------
+  // OFF BY DEFAULT. With filter=false no detection subscription is created and
+  // ImageData::mask stays empty, so FeatureTracker::setMask() takes its original
+  // all-255 path -- the stock tracker, bit for bit, and the recorded baseline
+  // stays reproducible.
+  filter_ = readParam<bool>(this, "filter", false);
+  mask_dilate_px_ = readParam<int>(this, "mask_dilate_px", 8);
+  det_max_age_ = readParam<double>(this, "det_max_age", 0.15);
+  // Measured on dataset/dynamic_dataset: dilated boxes cover mean 43.5% of the
+  // frame, p90 61%, max 72.8%. 0.8 sits above the observed maximum, so the valve
+  // only catches a runaway detection instead of firing during normal operation.
+  max_mask_fraction_ = readParam<double>(this, "max_mask_fraction", 0.8);
+
+  // What the filter ACTUALLY did this run, one row per frame, written next to
+  // vio.csv. Distinct from scoring the detector offline with script/yolo_eval.py:
+  // this records the masks the tracker really saw, including frames where no
+  // detection was recent enough and masks rejected for covering too much.
+  if (filter_ && !options->OUTPUT_FOLDER.empty()) {
+    const std::string p = options->OUTPUT_FOLDER + "/yolo_mask.csv";
+    mask_log_.open(p);
+    if (mask_log_) {
+      mask_log_ << "timestamp_ns,n_boxes,mask_coverage,matched,det_age_ms,rejected\n";
+      RCLCPP_INFO(this->get_logger(), "mask log -> %s", p.c_str());
+    } else {
+      RCLCPP_WARN(this->get_logger(), "could not open %s", p.c_str());
+    }
   }
 
   estimator_->initialize(options);
@@ -111,10 +176,33 @@ void VinsEstimator::initializeSubscribers() {
           ImageData image;
           image.image0 = fromMsg(*msg);
           image.timestamp = fromMsg(msg->header.stamp);
+          image.mask = maskFor(image.timestamp, image.image0.size());
+          logMask(msg->header.stamp);
           estimator_->inputImage(image);
         },
         sub_opt_image);
     subs_.push_back(sub_img0);
+  }
+
+  if (filter_) {
+    dets_callback_group_ =
+        this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_opt_dets;
+    sub_opt_dets.callback_group = dets_callback_group_;
+    auto dets_topic =
+        readParam<std::string>(this, "dynamic_dets_topic", "/orbslam3/dynamic_dets");
+    dets_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
+        dets_topic, rclcpp::SensorDataQoS(),
+        std::bind(&VinsEstimator::onDetections, this, std::placeholders::_1),
+        sub_opt_dets);
+    RCLCPP_INFO(this->get_logger(),
+                "filter: ON -- masking dynamic objects from %s (dilate %d px, "
+                "max age %.0f ms, max coverage %.0f%%)",
+                dets_topic.c_str(), mask_dilate_px_, det_max_age_ * 1e3,
+                max_mask_fraction_ * 100.0);
+  } else {
+    RCLCPP_INFO(this->get_logger(),
+                "filter: off (stock VINS feature tracking)");
   }
 
   auto sub_feature = this->create_subscription<sensor_msgs::msg::PointCloud>(
@@ -128,6 +216,12 @@ void VinsEstimator::initializeSubscribers() {
   publish_timer_ =
       this->create_wall_timer(std::chrono::milliseconds(20),
                               std::bind(&VinsEstimator::timeCallback, this));
+
+  if (filter_) {
+    filter_report_timer_ =
+        this->create_wall_timer(std::chrono::seconds(10),
+                                std::bind(&VinsEstimator::reportFilter, this));
+  }
 }
 void VinsEstimator::initializerPublishers() {
   pub_latest_odometry =
@@ -153,7 +247,105 @@ void VinsEstimator::stereoCallback(
   image.image0 = fromMsg(*img0);
   image.image1 = fromMsg(*img1);
   image.timestamp = fromMsg(img0->header.stamp);
+  image.mask = maskFor(image.timestamp, image.image0.size());
+  logMask(img0->header.stamp);
   estimator_->inputImage(image);
+}
+
+void VinsEstimator::onDetections(
+    const vision_msgs::msg::Detection2DArray::ConstSharedPtr& msg) {
+  std::vector<cv::Rect2f> boxes;
+  boxes.reserve(msg->detections.size());
+  for (const auto& det : msg->detections) {
+    const float w = static_cast<float>(det.bbox.size_x);
+    const float h = static_cast<float>(det.bbox.size_y);
+    if (w <= 0.0f || h <= 0.0f) continue;
+    boxes.emplace_back(static_cast<float>(det.bbox.center.position.x) - 0.5f * w,
+                       static_cast<float>(det.bbox.center.position.y) - 0.5f * h,
+                       w, h);
+  }
+  std::lock_guard<std::mutex> lk(dets_mu_);
+  dets_.emplace_back(fromMsg(msg->header.stamp), std::move(boxes));
+  // A couple of seconds of history at camera rate; anything older than
+  // det_max_age is unusable anyway, so this only bounds memory.
+  while (dets_.size() > 60) dets_.pop_front();
+}
+
+cv::Mat VinsEstimator::maskFor(double t, const cv::Size& size) {
+  if (!filter_) return cv::Mat();
+
+  std::vector<cv::Rect2f> boxes;
+  {
+    std::lock_guard<std::mutex> lk(dets_mu_);
+    double best = det_max_age_;
+    const std::vector<cv::Rect2f>* pick = nullptr;
+    for (const auto& entry : dets_) {
+      const double age = std::fabs(entry.first - t);
+      if (age <= best) {
+        best = age;
+        pick = &entry.second;
+      }
+    }
+    if (!pick) {
+      ++det_missed_;
+      last_ = LogRow{0, 0.0, false, -1.0, false};
+      return cv::Mat();
+    }
+    boxes = *pick;
+    last_age_ = best;
+  }
+  ++det_matched_;
+
+  // A real "nothing dynamic here" answer. An empty Mat is both correct and
+  // cheaper than an all-255 one: setMask() then takes its original path.
+  if (boxes.empty()) {
+    last_ = LogRow{0, 0.0, true, last_age_, false};
+    return cv::Mat();
+  }
+
+  cv::Mat mask(size, CV_8UC1, cv::Scalar(255));
+  const int d = std::max(0, mask_dilate_px_);
+  double dynamic_area = 0.0;
+  for (const auto& b : boxes) {
+    cv::Rect r(static_cast<int>(std::floor(b.x)) - d,
+               static_cast<int>(std::floor(b.y)) - d,
+               static_cast<int>(std::ceil(b.width)) + 2 * d,
+               static_cast<int>(std::ceil(b.height)) + 2 * d);
+    r &= cv::Rect(0, 0, size.width, size.height);
+    if (r.area() <= 0) continue;
+    // Count before painting so overlapping boxes are not double-counted.
+    dynamic_area += cv::countNonZero(mask(r));
+    mask(r).setTo(0);
+  }
+
+  const double fraction = dynamic_area / static_cast<double>(size.area());
+  if (fraction > max_mask_fraction_) {
+    ++mask_rejected_;
+    last_ = LogRow{boxes.size(), fraction, true, last_age_, true};
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "dynamic mask would cover %.0f%% of the frame (limit "
+                         "%.0f%%) -- ignoring it for this frame rather than "
+                         "starving the tracker",
+                         fraction * 100.0, max_mask_fraction_ * 100.0);
+    return cv::Mat();
+  }
+  last_ = LogRow{boxes.size(), fraction, true, last_age_, false};
+  return mask;
+}
+
+void VinsEstimator::logMask(const builtin_interfaces::msg::Time& stamp) {
+  if (!mask_log_) return;
+  const int64_t ns = static_cast<int64_t>(stamp.sec) * 1000000000LL +
+                     static_cast<int64_t>(stamp.nanosec);
+  mask_log_ << ns << ',' << last_.n_boxes << ','
+            << std::fixed << std::setprecision(4) << last_.coverage << ','
+            << (last_.matched ? 1 : 0) << ',' << std::setprecision(1)
+            << (last_.age_s < 0 ? -1.0 : last_.age_s * 1e3) << ','
+            << (last_.rejected ? 1 : 0) << '\n';
+  // Flush every row: this node's executor does not reliably return from spin()
+  // on SIGINT, so the destructor cannot be trusted to close the stream and the
+  // final line would be left truncated.
+  mask_log_.flush();
 }
 
 void VinsEstimator::timeCallback() {

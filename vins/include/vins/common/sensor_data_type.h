@@ -74,10 +74,17 @@ struct ImageData : SensorDataBase {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   cv::Mat image0 = cv::Mat();
   cv::Mat image1 = cv::Mat();
+  /// Optional dynamic-object mask for image0 (RY-SLAM style): CV_8UC1, same size
+  /// as image0, 255 = static/keep, 0 = dynamic. Consumed by
+  /// FeatureTracker::setMask(), which both drops tracked points that drift onto a
+  /// dynamic region and stops goodFeaturesToTrack seeding new ones there. Empty
+  /// (the default) means no filtering -- the stock upstream behaviour.
+  cv::Mat mask = cv::Mat();
   ImageData(const ImageData &other) {
     timestamp = other.timestamp;
     image0 = other.image0.clone();
     image1 = other.image1.clone();
+    mask = other.mask.clone();
   }
 
   ImageData &operator=(const ImageData &other) {
@@ -85,6 +92,7 @@ struct ImageData : SensorDataBase {
       timestamp = other.timestamp;
       image0 = other.image0.clone();
       image1 = other.image1.clone();
+      mask = other.mask.clone();
     }
     return *this;
   }
@@ -93,6 +101,7 @@ struct ImageData : SensorDataBase {
     timestamp = other.timestamp;
     image0 = std::move(other.image0);
     image1 = std::move(other.image1);
+    mask = std::move(other.mask);
   }
 
   ImageData &operator=(ImageData &&other) noexcept {
@@ -100,6 +109,7 @@ struct ImageData : SensorDataBase {
       timestamp = other.timestamp;
       image0 = std::move(other.image0);
       image1 = std::move(other.image1);
+      mask = std::move(other.mask);
     }
     return *this;
   }

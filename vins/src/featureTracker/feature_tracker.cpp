@@ -51,7 +51,37 @@ void FeatureTracker::setOptions(std::shared_ptr<VINSOptions> options_) {
 }
 
 void FeatureTracker::setMask() {
-  mask = cv::Mat(row, col, CV_8UC1, cv::Scalar(255));
+  // Seed from the dynamic-object mask rather than a blank 255 canvas.
+  //
+  // This one substitution does BOTH halves of the job, because upstream's own
+  // loop below already treats "mask is 0 here" as "do not keep this point":
+  //
+  //   * a TRACKED point that has drifted onto a dynamic region fails the
+  //     mask.at(...) == 255 test and is dropped from cur_pts/ids/track_cnt. That
+  //     matters far more here than it did in ORB-SLAM3: VINS propagates features
+  //     by KLT rather than re-detecting them every frame, so without this a point
+  //     that latched onto a moving box would ride it for hundreds of frames.
+  //   * a NEW point cannot be seeded there either, since this same Mat is handed
+  //     to goodFeaturesToTrack below as its mask argument.
+  //
+  // Dropping points here is upstream's established pattern -- it already discards
+  // any point falling inside a previously drawn min_feature_distance circle, and
+  // prev_pts is rebuilt wholesale from cur_pts at the end of trackImage -- so no
+  // index correspondence is broken by removing more of them.
+  if (dynamic_mask.empty()) {
+    mask = cv::Mat(row, col, CV_8UC1, cv::Scalar(255));
+  } else if (dynamic_mask.rows == row && dynamic_mask.cols == col &&
+             dynamic_mask.type() == CV_8UC1) {
+    mask = dynamic_mask.clone();
+  } else {
+    // Never read a mismatched mask: it would index out of bounds or be
+    // misinterpreted byte-wise. Degraded filtering beats a crash.
+    VINS_WARN << "dynamic mask ignored: expected CV_8UC1 " << col << "x" << row
+              << ", got " << dynamic_mask.cols << "x" << dynamic_mask.rows
+              << " type " << dynamic_mask.type();
+    mask = cv::Mat(row, col, CV_8UC1, cv::Scalar(255));
+  }
+  const size_t n_before = cur_pts.size();
 
   // prefer to keep features that are tracked for long time
   vector<pair<int, pair<cv::Point2f, int>>> cnt_pts_id;
@@ -78,6 +108,12 @@ void FeatureTracker::setMask() {
       cv::circle(mask, it.second.first, options->min_feature_distance, 0, -1);
     }
   }
+  // Only the points lost to the DYNAMIC regions are interesting; the ones lost to
+  // min-distance circles are normal operation. Recomputing the split exactly would
+  // mean a second pass, so attribute the drop only when a dynamic mask was in play.
+  if (!dynamic_mask.empty() && cur_pts.size() < n_before) {
+    dynamic_dropped += n_before - cur_pts.size();
+  }
 }
 
 void FeatureTracker::addPoints() {
@@ -96,10 +132,12 @@ double FeatureTracker::distance(cv::Point2f &pt1, cv::Point2f &pt2) {
 
 map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>>
 FeatureTracker::trackImage(double _cur_time, const cv::Mat &_img,
-                           const cv::Mat &_img1) {
+                           const cv::Mat &_img1,
+                           const cv::Mat &_dynamic_mask) {
   TicToc t_r;
   cur_time = _cur_time;
   cur_img = _img;
+  dynamic_mask = _dynamic_mask;
   row = cur_img.rows;
   col = cur_img.cols;
   cv::Mat rightImg = _img1;
