@@ -32,7 +32,9 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <mutex>
 #include <opencv2/core/eigen.hpp>
 #include <queue>
@@ -145,6 +147,9 @@ class Estimator {
   void updateCameraPose(int index);
   void collectPointCloudAll(Timestamp timestamp);
   void printStatistics(Timestamp timestamp);
+  void logEvent(Timestamp timestamp, const std::string &event,
+                const std::string &detail = "");
+  void writeRunSummary();
   template <typename Container>
   void clearBuffer(Container &container) {
     container.clear();
@@ -190,6 +195,27 @@ class Estimator {
   int frameCount = 0;
   int backCount = 0;
   int frontCount = 0;
+
+  // Cumulative scientific run accounting. These deliberately do not reset when
+  // the estimator reinitializes, so failed/recovered portions remain visible.
+  std::atomic<std::size_t> total_images_received_{0};
+  std::atomic<std::size_t> total_images_enqueued_{0};
+  std::atomic<std::size_t> total_images_processed_{0};
+  std::atomic<std::size_t> total_imu_received_{0};
+  std::atomic<std::size_t> total_imu_used_{0};
+  std::atomic<std::size_t> total_poses_written_{0};
+  std::atomic<std::size_t> total_keyframes_{0};
+  std::atomic<std::size_t> total_resets_{0};
+  std::atomic<std::size_t> imu_gap_resets_{0};
+  std::atomic<std::size_t> failure_resets_{0};
+  std::atomic<std::size_t> initialization_events_{0};
+  Timestamp first_processed_timestamp_{-1.0};
+  Timestamp first_initialized_timestamp_{-1.0};
+  Timestamp last_processed_timestamp_{-1.0};
+  std::ofstream performance_log_;
+  std::ofstream events_log_;
+  const std::chrono::steady_clock::time_point process_start_{
+      std::chrono::steady_clock::now()};
 
   FeatureManager featureManager;
   FeatureTracker featureTracker;

@@ -2,9 +2,24 @@
 #include <vins_fusion_ros2/vins_estimator.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <opencv2/imgproc.hpp>
+#include <rcpputils/filesystem_helper.hpp>
+#include <stdexcept>
+
+namespace {
+std::string csvEscape(const std::string& value) {
+  if (value.find_first_of(",\"\n\r") == std::string::npos) return value;
+  std::string escaped = "\"";
+  for (const char c : value) {
+    escaped += c;
+    if (c == '"') escaped += '"';
+  }
+  return escaped + '"';
+}
+}  // namespace
 
 VinsEstimator::VinsEstimator() : rclcpp::Node("vins_estimator") {
   options = std::make_shared<VINSOptions>();
@@ -30,22 +45,34 @@ void VinsEstimator::reportFilter() {
 }
 
 VinsEstimator::~VinsEstimator() {
-  if (!filter_) return;
-  RCLCPP_INFO(this->get_logger(),
-              "dynamic filter: %zu frames masked, %zu with no recent detection, "
-              "%zu tracked points dropped onto dynamic regions",
-              det_matched_, det_missed_, estimator_->dynamicDroppedPoints());
-  if (det_matched_ == 0) {
-    RCLCPP_WARN(this->get_logger(),
-                "filter was ON but NOT ONE frame matched a detection. Is the "
-                "detector node running, and is det_max_age (%.0f ms) long enough "
-                "for its inference time?",
-                det_max_age_ * 1e3);
+  if (!output_path_.empty()) {
+    std::ofstream out(output_path_ + "/filter_summary.csv");
+    if (out) {
+      out << "key,value\n"
+          << "filter_enabled," << (filter_ ? 1 : 0) << '\n'
+          << "detection_frames_matched," << det_matched_ << '\n'
+          << "detection_frames_missed," << det_missed_ << '\n'
+          << "masks_rejected," << mask_rejected_ << '\n'
+          << "dynamic_points_dropped," << estimator_->dynamicDroppedPoints() << '\n';
+    }
   }
-  if (mask_rejected_ > 0) {
-    RCLCPP_WARN(this->get_logger(),
-                "discarded %zu masks for exceeding max_mask_fraction",
-                mask_rejected_);
+  if (filter_) {
+    RCLCPP_INFO(this->get_logger(),
+                "dynamic filter: %zu frames masked, %zu with no recent detection, "
+                "%zu tracked points dropped onto dynamic regions",
+                det_matched_, det_missed_, estimator_->dynamicDroppedPoints());
+    if (det_matched_ == 0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "filter was ON but NOT ONE frame matched a detection. Is the "
+                  "detector node running, and is det_max_age (%.0f ms) long enough "
+                  "for its inference time?",
+                  det_max_age_ * 1e3);
+    }
+    if (mask_rejected_ > 0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "discarded %zu masks for exceeding max_mask_fraction",
+                  mask_rejected_);
+    }
   }
 }
 
@@ -63,16 +90,27 @@ void VinsEstimator::initializeParamters() {
 
   // Optional ROS param "output_path" overrides the config's output_path, so each
   // node instance can write its own vio.csv without editing the yaml. The
-  // directory must already exist (we don't mkdir). Empty = keep the config value.
+  // directory and any missing parents are created automatically. Empty = keep
+  // the config value.
   auto output_path = readParam<std::string>(this, "output_path", "");
   if (!output_path.empty()) {
+    if (!rcpputils::fs::create_directories(rcpputils::fs::path(output_path))) {
+      throw std::runtime_error("Could not create output_path directory: " +
+                               output_path);
+    }
+
     options->OUTPUT_FOLDER = output_path;
     options->VINS_RESULT_PATH = output_path + "/vio.csv";
     options->POSE_GRAPH_SAVE_PATH = output_path + "/pose_graph/";
-    std::ofstream(options->VINS_RESULT_PATH, std::ios::out);  // truncate/create fresh
+    std::ofstream output_file(options->VINS_RESULT_PATH, std::ios::out);
+    if (!output_file) {
+      throw std::runtime_error("Could not create VINS result file: " +
+                               options->VINS_RESULT_PATH);
+    }
     RCLCPP_INFO(this->get_logger(), "output_path override -> %s",
                 options->VINS_RESULT_PATH.c_str());
   }
+  output_path_ = options->OUTPUT_FOLDER;
 
   // Optional ROS param "pose_graph_save_path" wins over both the config value and
   // the output_path-derived default above, so a run can point its pose graph
@@ -97,6 +135,40 @@ void VinsEstimator::initializeParamters() {
   // frame, p90 61%, max 72.8%. 0.8 sits above the observed maximum, so the valve
   // only catches a runaway detection instead of firing during normal operation.
   max_mask_fraction_ = readParam<double>(this, "max_mask_fraction", 0.8);
+
+  const auto experiment_id = readParam<std::string>(this, "experiment_id", "");
+  const auto dataset_path = readParam<std::string>(this, "dataset_path", "");
+  const auto world_path = readParam<std::string>(this, "world_path", "");
+  const auto replay_rate = readParam<double>(this, "replay_rate", 1.0);
+  const auto run_command = readParam<std::string>(this, "run_command", "");
+  const auto run_notes = readParam<std::string>(this, "run_notes", "");
+
+  if (!output_path_.empty()) {
+    std::ofstream metadata(output_path_ + "/run_metadata.csv");
+    if (!metadata) {
+      throw std::runtime_error("Could not create run metadata in: " + output_path_);
+    }
+    metadata << "key,value\n";
+    const std::vector<std::pair<std::string, std::string>> rows = {
+        {"pipeline", "vins_fusion_ros2"}, {"experiment_id", experiment_id},
+        {"dataset_path", dataset_path}, {"world_path", world_path},
+        {"run_command", run_command}, {"run_notes", run_notes},
+        {"config_file", config_file}, {"output_path", output_path_},
+        {"image0_topic", options->imageTopic()},
+        {"image1_topic", options->image1Topic()}, {"imu_topic", options->imuTopic()},
+        {"world_frame_id", world_frame_id}, {"body_frame_id", body_frame_id},
+        {"camera_frame_id", camera_frame_id}, {"filter", filter_ ? "true" : "false"},
+        {"replay_rate", std::to_string(replay_rate)},
+        {"det_max_age_s", std::to_string(det_max_age_)},
+        {"mask_dilate_px", std::to_string(mask_dilate_px_)},
+        {"max_mask_fraction", std::to_string(max_mask_fraction_)},
+        {"start_wall_time_unix_ns", std::to_string(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count())}};
+    for (const auto& row : rows) {
+      metadata << csvEscape(row.first) << ',' << csvEscape(row.second) << '\n';
+    }
+  }
 
   // What the filter ACTUALLY did this run, one row per frame, written next to
   // vio.csv. Distinct from scoring the detector offline with script/yolo_eval.py:

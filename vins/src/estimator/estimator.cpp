@@ -11,6 +11,26 @@
 #include <vins/estimator/estimator.h>
 
 #include <fstream>
+#include <sys/resource.h>
+#include <unistd.h>
+
+namespace {
+double processCpuMs() {
+  struct rusage usage {};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) return -1.0;
+  return usage.ru_utime.tv_sec * 1e3 + usage.ru_utime.tv_usec * 1e-3 +
+         usage.ru_stime.tv_sec * 1e3 + usage.ru_stime.tv_usec * 1e-3;
+}
+
+long residentMemoryKb() {
+  std::ifstream statm("/proc/self/statm");
+  long total_pages = 0;
+  long resident_pages = 0;
+  if (!(statm >> total_pages >> resident_pages)) return -1;
+  (void)total_pages;
+  return resident_pages * sysconf(_SC_PAGESIZE) / 1024;
+}
+}  // namespace
 
 Estimator::Estimator() {}
 
@@ -23,9 +43,12 @@ Estimator::~Estimator() {
       processThread.join();
     }
   }
+  logEvent(last_processed_timestamp_, "shutdown", "graceful");
+  writeRunSummary();
 }
 
 void Estimator::resetState() {
+  ++total_resets_;
   {
     std::lock_guard<std::mutex> imu_lock(imu_mutex);
     clearBuffer(imuBuffer);
@@ -76,6 +99,31 @@ void Estimator::initialize(std::shared_ptr<VINSOptions> options_) {
   std::lock_guard<std::mutex> lock(processingMutex);
   options = options_;
   initializeCamerasFromOptions();
+  if (!options->OUTPUT_FOLDER.empty()) {
+    performance_log_.open(options->OUTPUT_FOLDER + "/performance.csv",
+                          std::ios::out | std::ios::trunc);
+    events_log_.open(options->OUTPUT_FOLDER + "/events.csv",
+                     std::ios::out | std::ios::trunc);
+    if (performance_log_) {
+      performance_log_
+          << "timestamp_ns,solver_state,initialized_this_frame,keyframe,"
+             "marginalization,processing_ms,imu_samples,feature_count,"
+             "feature_backlog,images_received,images_enqueued,images_processed,"
+             "imu_received,imu_used,poses_written,resets,imu_gap_resets,"
+             "failure_resets,dynamic_points_dropped,process_cpu_ms,"
+             "wall_elapsed_ms,resident_memory_kb\n";
+      performance_log_.flush();
+    } else {
+      VINS_WARN << "Could not open performance.csv in " << options->OUTPUT_FOLDER;
+    }
+    if (events_log_) {
+      events_log_ << "timestamp_ns,event,detail\n";
+      events_log_.flush();
+      logEvent(0.0, "startup", "estimator_initialized");
+    } else {
+      VINS_WARN << "Could not open events.csv in " << options->OUTPUT_FOLDER;
+    }
+  }
   isRunning.store(true);
   processThread = std::thread(&Estimator::processMeasurements, this);
 }
@@ -102,6 +150,7 @@ void Estimator::initializeCamerasFromOptions() {
 }
 
 void Estimator::inputImage(const ImageData &image) {
+  ++total_images_received_;
   inputImageCount++;
   FeatureFrame featureFrame;
   TicToc featureTrackerTime;
@@ -123,12 +172,14 @@ void Estimator::inputImage(const ImageData &image) {
     {
       std::lock_guard<std::mutex> lock(featureBufferMutex);
       featureBuffer.push(make_pair(image.timestamp, featureFrame));
+      ++total_images_enqueued_;
     }
     featureCondition.notify_one();
   }
 }
 
 void Estimator::inputIMU(const IMUData &imu) {
+  ++total_imu_received_;
   {
     std::lock_guard<std::mutex> lock(imu_mutex);
     imuBuffer.push(imu);
@@ -145,6 +196,7 @@ void Estimator::inputFeature(double timestamp,
   {
     std::lock_guard<std::mutex> lock(featureBufferMutex);
     featureBuffer.push(make_pair(timestamp, featureFrame));
+    ++total_images_enqueued_;
   }
   featureCondition.notify_one();
 }
@@ -207,6 +259,7 @@ void Estimator::processMeasurements() {
 
     if (options->hasImu()) {
       getIMUInterval(previousTimestamp, currentTimestamp, imu_datas);
+      total_imu_used_ += imu_datas.size();
       if (!isFirstPoseInitialized) initFirstIMUPose(imu_datas);
       for (size_t i = 0; i < imu_datas.size(); i++) {
         double dt;
@@ -220,12 +273,34 @@ void Estimator::processMeasurements() {
       }
     }
     TicToc t_proc;
+    const SolverState solver_before = solver_flag;
     {
       std::lock_guard<std::mutex> lock(processingMutex);
       processImage(feature.second, feature.first);
       printStatistics(currentTimestamp);
       collectPointCloudAll(feature.first);
       previousTimestamp = currentTimestamp;
+    }
+    const double processing_ms = t_proc.toc();
+    ++total_images_processed_;
+    if (first_processed_timestamp_ < 0.0) {
+      first_processed_timestamp_ = feature.first;
+    }
+    last_processed_timestamp_ = feature.first;
+    const bool initialized_this_frame =
+        solver_before != SolverState::NON_LINEAR &&
+        solver_flag == SolverState::NON_LINEAR;
+    if (initialized_this_frame) {
+      ++initialization_events_;
+      if (first_initialized_timestamp_ < 0.0) {
+        first_initialized_timestamp_ = feature.first;
+      }
+      logEvent(feature.first, "initialization_complete", "solver_non_linear");
+    }
+    const bool keyframe = solver_flag == SolverState::NON_LINEAR &&
+        marginalization_flag == MarginalizationType::MARGIN_OLD;
+    if (keyframe) {
+      ++total_keyframes_;
     }
     // Real-time profiling: per-frame wall-clock processing cost and the feature backlog.
     // If proc_ms stays under the inter-keyframe period and backlog stays small, the node
@@ -235,9 +310,66 @@ void Estimator::processMeasurements() {
       std::lock_guard<std::mutex> fl(featureBufferMutex);
       backlog = featureBuffer.size();
     }
-    VINS_INFO << "PERF t=" << currentTimestamp << " proc_ms=" << t_proc.toc()
+    VINS_INFO << "PERF t=" << currentTimestamp << " proc_ms=" << processing_ms
               << " backlog=" << backlog << " recv=" << inputImageCount;
+    if (performance_log_) {
+      performance_log_.setf(std::ios::fixed, std::ios::floatfield);
+      performance_log_.precision(0);
+      performance_log_ << feature.first * 1e9 << ','
+          << (solver_flag == SolverState::NON_LINEAR ? 1 : 0) << ','
+          << (initialized_this_frame ? 1 : 0) << ',' << (keyframe ? 1 : 0) << ','
+          << (marginalization_flag == MarginalizationType::MARGIN_OLD ? 0 : 1) << ',';
+      performance_log_.precision(3);
+      performance_log_ << processing_ms << ',' << imu_datas.size() << ','
+          << feature.second.size() << ',' << backlog << ','
+          << total_images_received_.load() << ',' << total_images_enqueued_.load() << ','
+          << total_images_processed_.load() << ',' << total_imu_received_.load() << ','
+          << total_imu_used_.load() << ',' << total_poses_written_.load() << ','
+          << total_resets_.load() << ',' << imu_gap_resets_.load() << ','
+          << failure_resets_.load() << ',' << featureTracker.dynamic_dropped << ','
+          << processCpuMs() << ','
+          << std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - process_start_).count()
+          << ',' << residentMemoryKb() << '\n';
+      performance_log_.flush();
+    }
   }
+}
+
+void Estimator::logEvent(Timestamp timestamp, const std::string &event,
+                         const std::string &detail) {
+  if (!events_log_) return;
+  events_log_.setf(std::ios::fixed, std::ios::floatfield);
+  events_log_.precision(0);
+  events_log_ << timestamp * 1e9 << ',' << event << ',' << detail << '\n';
+  events_log_.flush();
+}
+
+void Estimator::writeRunSummary() {
+  if (!options || options->OUTPUT_FOLDER.empty()) return;
+  std::ofstream out(options->OUTPUT_FOLDER + "/run_summary.csv",
+                    std::ios::out | std::ios::trunc);
+  if (!out) return;
+  const double initialization_time =
+      first_processed_timestamp_ >= 0.0 && first_initialized_timestamp_ >= 0.0
+          ? first_initialized_timestamp_ - first_processed_timestamp_
+          : -1.0;
+  out << "key,value\n"
+      << "shutdown_status,graceful\n"
+      << "images_received," << total_images_received_.load() << '\n'
+      << "images_enqueued," << total_images_enqueued_.load() << '\n'
+      << "images_processed," << total_images_processed_.load() << '\n'
+      << "imu_messages_received," << total_imu_received_.load() << '\n'
+      << "imu_samples_used," << total_imu_used_.load() << '\n'
+      << "poses_written," << total_poses_written_.load() << '\n'
+      << "keyframes," << total_keyframes_.load() << '\n'
+      << "initialization_events," << initialization_events_.load() << '\n'
+      << "initialization_time_s," << std::fixed << std::setprecision(6)
+      << initialization_time << '\n'
+      << "resets," << total_resets_.load() << '\n'
+      << "imu_gap_resets," << imu_gap_resets_.load() << '\n'
+      << "failure_resets," << failure_resets_.load() << '\n'
+      << "dynamic_points_dropped," << featureTracker.dynamic_dropped << '\n';
 }
 void Estimator::updateCameraPose(int index) {
   PoseData pose;
@@ -479,6 +611,8 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
     VINS_WARN << "Re-initializing after IMU gap (dropped messages).";
     imu_gap_detected = false;
     failure_occur = 1;
+    ++imu_gap_resets_;
+    logEvent(timestamp, "reset", "imu_gap");
     resetState();
     initializeCamerasFromOptions();
     return;
@@ -498,6 +632,8 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
   featureManager.removeOutlier(removeIndex);
   if (failureDetection()) {
     failure_occur = 1;
+    ++failure_resets_;
+    logEvent(timestamp, "reset", "failure_detection");
     resetState();
     initializeCamerasFromOptions();
     return;
@@ -540,6 +676,7 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
             << vio_odom.orientation.x() << "," << vio_odom.orientation.y() << ","
             << vio_odom.orientation.z() << "," << vio_odom.velocity.x() << ","
             << vio_odom.velocity.y() << "," << vio_odom.velocity.z() << std::endl;
+      ++total_poses_written_;
     }
   }
 }

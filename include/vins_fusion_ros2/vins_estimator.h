@@ -106,6 +106,7 @@ class VinsEstimator : public rclcpp::Node {
   LogRow last_;
   double last_age_ = -1.0;
   std::ofstream mask_log_;
+  std::string output_path_;
 
   std::size_t det_matched_ = 0;
   std::size_t det_missed_ = 0;
