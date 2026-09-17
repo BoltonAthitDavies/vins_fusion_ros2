@@ -142,6 +142,8 @@ void VinsEstimator::initializeParamters() {
   const auto replay_rate = readParam<double>(this, "replay_rate", 1.0);
   const auto run_command = readParam<std::string>(this, "run_command", "");
   const auto run_notes = readParam<std::string>(this, "run_notes", "");
+  bool use_sim_time = false;
+  (void)this->get_parameter("use_sim_time", use_sim_time);
 
   if (!output_path_.empty()) {
     std::ofstream metadata(output_path_ + "/run_metadata.csv");
@@ -158,6 +160,12 @@ void VinsEstimator::initializeParamters() {
         {"image1_topic", options->image1Topic()}, {"imu_topic", options->imuTopic()},
         {"world_frame_id", world_frame_id}, {"body_frame_id", body_frame_id},
         {"camera_frame_id", camera_frame_id}, {"filter", filter_ ? "true" : "false"},
+        {"use_sim_time", use_sim_time ? "true" : "false"},
+        {"use_imu", options->hasImu() ? "true" : "false"},
+        {"use_stereo", options->isUsingStereo() ? "true" : "false"},
+        {"image_skip", std::to_string(options->imageSkip())},
+        {"max_solver_iterations", std::to_string(options->max_num_iterations())},
+        {"max_solver_time_s", std::to_string(options->max_solver_time())},
         {"replay_rate", std::to_string(replay_rate)},
         {"det_max_age_s", std::to_string(det_max_age_)},
         {"mask_dilate_px", std::to_string(mask_dilate_px_)},

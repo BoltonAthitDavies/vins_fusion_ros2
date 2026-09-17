@@ -10,7 +10,9 @@
 
 #include <vins/estimator/estimator.h>
 
+#include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -56,6 +58,8 @@ void Estimator::resetState() {
   {
     std::lock_guard<std::mutex> feature_lock(featureBufferMutex);
     clearBuffer(featureBuffer);
+    clearBuffer(featureEnqueueTimes);
+    clearBuffer(featureFromExternalSource);
   }
 
   // NOTE: resetState() is only called from processNonLinearSolver's failure/gap-reset
@@ -104,6 +108,12 @@ void Estimator::initialize(std::shared_ptr<VINSOptions> options_) {
                           std::ios::out | std::ios::trunc);
     events_log_.open(options->OUTPUT_FOLDER + "/events.csv",
                      std::ios::out | std::ios::trunc);
+    frontend_log_.open(options->OUTPUT_FOLDER + "/frontend.csv",
+                       std::ios::out | std::ios::trunc);
+    backend_log_.open(options->OUTPUT_FOLDER + "/backend.csv",
+                      std::ios::out | std::ios::trunc);
+    state_log_.open(options->OUTPUT_FOLDER + "/estimator_state.csv",
+                    std::ios::out | std::ios::trunc);
     if (performance_log_) {
       performance_log_
           << "timestamp_ns,solver_state,initialized_this_frame,keyframe,"
@@ -122,6 +132,42 @@ void Estimator::initialize(std::shared_ptr<VINSOptions> options_) {
       logEvent(0.0, "startup", "estimator_initialized");
     } else {
       VINS_WARN << "Could not open events.csv in " << options->OUTPUT_FOLDER;
+    }
+    if (frontend_log_) {
+      frontend_log_
+          << "timestamp_ns,feature_tracking_ms,feature_count,stereo_feature_count,"
+             "enqueued,feature_backlog,images_received,images_enqueued,"
+             "dynamic_points_dropped\n";
+      frontend_log_.flush();
+    } else {
+      VINS_WARN << "Could not open frontend.csv in " << options->OUTPUT_FOLDER;
+    }
+    if (backend_log_) {
+      backend_log_
+          << "timestamp_ns,solver_state,initialized_this_frame,keyframe,marginalization,"
+             "external_feature_source,"
+             "feature_queue_wait_ms,imu_wait_ms,imu_propagation_ms,visual_update_ms,"
+             "initialization_ms,triangulation_ms,parameter_preparation_ms,"
+             "problem_construction_ms,solver_ms,estimate_update_ms,marginalization_ms,"
+             "outlier_rejection_ms,failure_detection_ms,slide_window_ms,state_output_ms,"
+             "estimator_update_ms,pointcloud_ms,backend_total_ms,imu_samples,input_features,"
+             "tracked_features,new_features,long_tracks,average_parallax_px,managed_features,"
+             "optimized_features,outliers_removed,solver_calls,solver_iterations,"
+             "solver_parameter_blocks,solver_residual_blocks,solver_residuals,"
+             "solver_termination_type,solver_solution_usable,solver_initial_cost,"
+             "solver_final_cost,feature_backlog,accel_bias_norm,gyro_bias_norm,velocity_norm\n";
+      backend_log_.flush();
+    } else {
+      VINS_WARN << "Could not open backend.csv in " << options->OUTPUT_FOLDER;
+    }
+    if (state_log_) {
+      state_log_
+          << "timestamp_ns,solver_state,frame_index,px,py,pz,qw,qx,qy,qz,vx,vy,vz,"
+             "accel_bias_x,accel_bias_y,accel_bias_z,gyro_bias_x,gyro_bias_y,gyro_bias_z,"
+             "time_delay_s\n";
+      state_log_.flush();
+    } else {
+      VINS_WARN << "Could not open estimator_state.csv in " << options->OUTPUT_FOLDER;
     }
   }
   isRunning.store(true);
@@ -162,19 +208,50 @@ void Estimator::inputImage(const ImageData &image) {
     featureFrame = featureTracker.trackImage(image.timestamp, image.image0,
                                              image.image1, image.mask);
   }
+  const double feature_tracking_ms = featureTrackerTime.toc();
   if (options->shouldShowTrack()) {
     track_image.image0 = featureTracker.getTrackImage();
     track_image.timestamp = image.timestamp;
     safe_track_image.set(track_image);
   }
 
-  if (inputImageCount % options->imageSkip() == 0 || featureBuffer.empty()) {
-    {
-      std::lock_guard<std::mutex> lock(featureBufferMutex);
+  bool enqueued = false;
+  std::size_t feature_backlog = 0;
+  {
+    std::lock_guard<std::mutex> lock(featureBufferMutex);
+    if (inputImageCount % options->imageSkip() == 0 || featureBuffer.empty()) {
       featureBuffer.push(make_pair(image.timestamp, featureFrame));
+      featureEnqueueTimes.push(std::chrono::steady_clock::now());
+      featureFromExternalSource.push(false);
       ++total_images_enqueued_;
+      ++total_image_frames_enqueued_;
+      enqueued = true;
     }
+    feature_backlog = featureBuffer.size();
+  }
+  if (enqueued) {
     featureCondition.notify_one();
+  }
+
+  std::size_t stereo_feature_count = 0;
+  for (const auto &feature : featureFrame) {
+    if (feature.second.size() > 1) ++stereo_feature_count;
+  }
+  ++frontend_rows_;
+  {
+    std::lock_guard<std::mutex> lock(frontend_log_mutex_);
+    if (frontend_log_) {
+      frontend_log_.setf(std::ios::fixed, std::ios::floatfield);
+      frontend_log_.precision(0);
+      frontend_log_ << image.timestamp * 1e9 << ',';
+      frontend_log_.precision(3);
+      frontend_log_ << feature_tracking_ms << ',' << featureFrame.size() << ','
+                    << stereo_feature_count << ',' << (enqueued ? 1 : 0) << ','
+                    << feature_backlog << ',' << total_images_received_.load() << ','
+                    << total_image_frames_enqueued_.load() << ','
+                    << featureTracker.dynamic_dropped << '\n';
+      frontend_log_.flush();
+    }
   }
 }
 
@@ -193,9 +270,12 @@ void Estimator::inputIMU(const IMUData &imu) {
 
 void Estimator::inputFeature(double timestamp,
                              const FeatureFrame &featureFrame) {
+  ++total_external_feature_frames_;
   {
     std::lock_guard<std::mutex> lock(featureBufferMutex);
     featureBuffer.push(make_pair(timestamp, featureFrame));
+    featureEnqueueTimes.push(std::chrono::steady_clock::now());
+    featureFromExternalSource.push(true);
     ++total_images_enqueued_;
   }
   featureCondition.notify_one();
@@ -235,6 +315,8 @@ bool Estimator::IMUAvailable(double t) {
 void Estimator::processMeasurements() {
   while (isRunning.load()) {
     TimestampedFeatureFrame feature;
+    std::chrono::steady_clock::time_point feature_enqueued_at;
+    bool external_feature_source = false;
     vector<IMUData> imu_datas;
     {
       std::unique_lock<std::mutex> lock(featureBufferMutex);
@@ -243,10 +325,27 @@ void Estimator::processMeasurements() {
       if (!isRunning.load() || featureBuffer.empty()) break;
       feature = featureBuffer.front();
       featureBuffer.pop();
+      if (!featureEnqueueTimes.empty()) {
+        feature_enqueued_at = featureEnqueueTimes.front();
+        featureEnqueueTimes.pop();
+      } else {
+        // Defensive fallback for old/direct producers. Every in-tree producer
+        // pushes both queues while holding featureBufferMutex.
+        feature_enqueued_at = std::chrono::steady_clock::now();
+      }
+      if (!featureFromExternalSource.empty()) {
+        external_feature_source = featureFromExternalSource.front();
+        featureFromExternalSource.pop();
+      }
       lock.unlock();
     }
+    const auto backend_start = std::chrono::steady_clock::now();
+    frame_metrics_ = FrameMetrics{};
+    frame_metrics_.feature_queue_wait_ms =
+        std::chrono::duration<double, std::milli>(backend_start - feature_enqueued_at).count();
     currentTimestamp = feature.first + options->time_delay;
     if (options->hasImu()) {
+      const auto imu_wait_start = std::chrono::steady_clock::now();
       std::unique_lock<std::mutex> lock(imu_mutex);
 
       imuCondition.wait(lock, [this] {
@@ -255,8 +354,11 @@ void Estimator::processMeasurements() {
       if (!isRunning.load()) {
         break;
       }
+      frame_metrics_.imu_wait_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - imu_wait_start).count();
     }
 
+    const auto imu_propagation_start = std::chrono::steady_clock::now();
     if (options->hasImu()) {
       getIMUInterval(previousTimestamp, currentTimestamp, imu_datas);
       total_imu_used_ += imu_datas.size();
@@ -272,16 +374,26 @@ void Estimator::processMeasurements() {
         processIMU(imu_datas[i], dt);
       }
     }
+    frame_metrics_.imu_propagation_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - imu_propagation_start).count();
     TicToc t_proc;
     const SolverState solver_before = solver_flag;
     {
       std::lock_guard<std::mutex> lock(processingMutex);
+      const auto estimator_update_start = std::chrono::steady_clock::now();
       processImage(feature.second, feature.first);
+      frame_metrics_.estimator_update_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - estimator_update_start).count();
+      const auto pointcloud_start = std::chrono::steady_clock::now();
       printStatistics(currentTimestamp);
       collectPointCloudAll(feature.first);
+      frame_metrics_.pointcloud_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - pointcloud_start).count();
       previousTimestamp = currentTimestamp;
     }
     const double processing_ms = t_proc.toc();
+    frame_metrics_.backend_total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - backend_start).count();
     ++total_images_processed_;
     if (first_processed_timestamp_ < 0.0) {
       first_processed_timestamp_ = feature.first;
@@ -309,6 +421,64 @@ void Estimator::processMeasurements() {
     {
       std::lock_guard<std::mutex> fl(featureBufferMutex);
       backlog = featureBuffer.size();
+    }
+    const int active_state_index = std::min(frameCount, WINDOW_SIZE);
+    const auto &active_state = estimator_state[active_state_index];
+    const std::size_t managed_features = featureManager.feature.size();
+    const int optimized_features = featureManager.getFeatureCount();
+
+    ++backend_rows_;
+    if (backend_log_) {
+      backend_log_.setf(std::ios::fixed, std::ios::floatfield);
+      backend_log_.precision(0);
+      backend_log_ << feature.first * 1e9 << ','
+          << (solver_flag == SolverState::NON_LINEAR ? 1 : 0) << ','
+          << (initialized_this_frame ? 1 : 0) << ',' << (keyframe ? 1 : 0) << ','
+          << (marginalization_flag == MarginalizationType::MARGIN_OLD ? 0 : 1) << ','
+          << (external_feature_source ? 1 : 0) << ',';
+      backend_log_.precision(3);
+      backend_log_
+          << frame_metrics_.feature_queue_wait_ms << ',' << frame_metrics_.imu_wait_ms << ','
+          << frame_metrics_.imu_propagation_ms << ',' << frame_metrics_.visual_update_ms << ','
+          << frame_metrics_.initialization_ms << ',' << frame_metrics_.triangulation_ms << ','
+          << frame_metrics_.parameter_preparation_ms << ','
+          << frame_metrics_.problem_construction_ms << ',' << frame_metrics_.solver_ms << ','
+          << frame_metrics_.estimate_update_ms << ',' << frame_metrics_.marginalization_ms << ','
+          << frame_metrics_.outlier_rejection_ms << ','
+          << frame_metrics_.failure_detection_ms << ',' << frame_metrics_.slide_window_ms << ','
+          << frame_metrics_.state_output_ms << ',' << frame_metrics_.estimator_update_ms << ','
+          << frame_metrics_.pointcloud_ms << ',' << frame_metrics_.backend_total_ms << ','
+          << imu_datas.size() << ',' << feature.second.size() << ','
+          << featureManager.last_track_num << ',' << featureManager.new_feature_num << ','
+          << featureManager.long_track_num << ',' << featureManager.last_average_parallax << ','
+          << managed_features << ',' << optimized_features << ','
+          << frame_metrics_.outliers_removed << ',' << frame_metrics_.solver_calls << ','
+          << frame_metrics_.solver_iterations << ',' << frame_metrics_.solver_parameter_blocks << ','
+          << frame_metrics_.solver_residual_blocks << ',' << frame_metrics_.solver_residuals << ','
+          << frame_metrics_.solver_termination_type << ','
+          << (frame_metrics_.solver_solution_usable ? 1 : 0) << ','
+          << frame_metrics_.solver_initial_cost << ',' << frame_metrics_.solver_final_cost << ','
+          << backlog << ',' << active_state.accel_bias.norm() << ','
+          << active_state.gyro_bias.norm() << ',' << active_state.velocity.norm() << '\n';
+      backend_log_.flush();
+    }
+    if (state_log_) {
+      const Quaterniond q(active_state.rotation);
+      state_log_.setf(std::ios::fixed, std::ios::floatfield);
+      state_log_.precision(0);
+      state_log_ << feature.first * 1e9 << ','
+                 << (solver_flag == SolverState::NON_LINEAR ? 1 : 0) << ','
+                 << active_state_index << ',';
+      state_log_.precision(9);
+      state_log_ << active_state.position.x() << ',' << active_state.position.y() << ','
+                 << active_state.position.z() << ',' << q.w() << ',' << q.x() << ','
+                 << q.y() << ',' << q.z() << ',' << active_state.velocity.x() << ','
+                 << active_state.velocity.y() << ',' << active_state.velocity.z() << ','
+                 << active_state.accel_bias.x() << ',' << active_state.accel_bias.y() << ','
+                 << active_state.accel_bias.z() << ',' << active_state.gyro_bias.x() << ','
+                 << active_state.gyro_bias.y() << ',' << active_state.gyro_bias.z() << ','
+                 << options->time_delay << '\n';
+      state_log_.flush();
     }
     VINS_INFO << "PERF t=" << currentTimestamp << " proc_ms=" << processing_ms
               << " backlog=" << backlog << " recv=" << inputImageCount;
@@ -358,7 +528,16 @@ void Estimator::writeRunSummary() {
       << "shutdown_status,graceful\n"
       << "images_received," << total_images_received_.load() << '\n'
       << "images_enqueued," << total_images_enqueued_.load() << '\n'
+      << "image_frames_enqueued," << total_image_frames_enqueued_.load() << '\n'
+      << "external_feature_frames_received,"
+      << total_external_feature_frames_.load() << '\n'
       << "images_processed," << total_images_processed_.load() << '\n'
+      << "frontend_rows," << frontend_rows_.load() << '\n'
+      << "backend_rows," << backend_rows_.load() << '\n'
+      << "images_skipped_before_backend,"
+      << (total_images_received_.load() >= total_image_frames_enqueued_.load()
+              ? total_images_received_.load() - total_image_frames_enqueued_.load()
+              : 0) << '\n'
       << "imu_messages_received," << total_imu_received_.load() << '\n'
       << "imu_samples_used," << total_imu_used_.load() << '\n'
       << "poses_written," << total_poses_written_.load() << '\n'
@@ -369,6 +548,9 @@ void Estimator::writeRunSummary() {
       << "resets," << total_resets_.load() << '\n'
       << "imu_gap_resets," << imu_gap_resets_.load() << '\n'
       << "failure_resets," << failure_resets_.load() << '\n'
+      << "failure_detection_enabled,0\n"
+      << "solver_calls," << total_solver_calls_.load() << '\n'
+      << "outliers_removed," << total_outliers_removed_.load() << '\n'
       << "dynamic_points_dropped," << featureTracker.dynamic_dropped << '\n';
 }
 void Estimator::updateCameraPose(int index) {
@@ -544,11 +726,17 @@ void Estimator::updateStateWithIMU(const IMUData &data, double deltaTime) {
 
 void Estimator::processImage(const FeatureFrame &features,
                              Timestamp timestamp) {
+  const auto visual_update_start = std::chrono::steady_clock::now();
   setMarginalizationFlag(features);
   insertImageFrame(features, timestamp);
   handleExtrinsicInitialization();
+  frame_metrics_.visual_update_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - visual_update_start).count();
   if (!isNonLinearSolver()) {
+    const auto initialization_start = std::chrono::steady_clock::now();
     processInitialization(timestamp);
+    frame_metrics_.initialization_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - initialization_start).count();
   } else {
     processNonLinearSolver(timestamp);
   }
@@ -617,20 +805,30 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
     initializeCamerasFromOptions();
     return;
   }
+  const auto triangulation_start = std::chrono::steady_clock::now();
   if (!options->hasImu()) {
     featureManager.initFramePoseByPnP(frameCount, estimator_state,
                                       cameraTranslation, cameraRotation);
   }
   featureManager.triangulate(frameCount, estimator_state, cameraTranslation,
                              cameraRotation);
+  frame_metrics_.triangulation_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - triangulation_start).count();
 
-  // optimization
-  TicToc t_solve;
   optimize();
   set<int> removeIndex;
+  const auto outlier_start = std::chrono::steady_clock::now();
   outliersRejection(removeIndex);
   featureManager.removeOutlier(removeIndex);
-  if (failureDetection()) {
+  frame_metrics_.outlier_rejection_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - outlier_start).count();
+  frame_metrics_.outliers_removed += removeIndex.size();
+  total_outliers_removed_.fetch_add(removeIndex.size());
+  const auto failure_detection_start = std::chrono::steady_clock::now();
+  const bool failure_detected = failureDetection();
+  frame_metrics_.failure_detection_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - failure_detection_start).count();
+  if (failure_detected) {
     failure_occur = 1;
     ++failure_resets_;
     logEvent(timestamp, "reset", "failure_detection");
@@ -640,6 +838,7 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
   }
 
   slideWindow();
+  const auto state_output_start = std::chrono::steady_clock::now();
   featureManager.removeFailures();
   // prepare output of VINS
   {
@@ -679,6 +878,8 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
       ++total_poses_written_;
     }
   }
+  frame_metrics_.state_output_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - state_output_start).count();
 }
 
 void Estimator::processMonoWithImuInitialization(Timestamp timestamp) {
@@ -702,10 +903,13 @@ void Estimator::processMonoWithImuInitialization(Timestamp timestamp) {
 }
 
 void Estimator::processStereoWithImuInitialization() {
+  const auto triangulation_start = std::chrono::steady_clock::now();
   featureManager.initFramePoseByPnP(frameCount, estimator_state,
                                     cameraTranslation, cameraRotation);
   featureManager.triangulate(frameCount, estimator_state, cameraTranslation,
                              cameraRotation);
+  frame_metrics_.triangulation_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - triangulation_start).count();
 
   if (frameCount != WINDOW_SIZE) return;
 
@@ -730,10 +934,13 @@ void Estimator::processStereoWithImuInitialization() {
 }
 
 void Estimator::processStereoWithoutImuInitialization() {
+  const auto triangulation_start = std::chrono::steady_clock::now();
   featureManager.initFramePoseByPnP(frameCount, estimator_state,
                                     cameraTranslation, cameraRotation);
   featureManager.triangulate(frameCount, estimator_state, cameraTranslation,
                              cameraRotation);
+  frame_metrics_.triangulation_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - triangulation_start).count();
   optimize();
 
   if (frameCount != WINDOW_SIZE) return;
@@ -1195,6 +1402,7 @@ void Estimator::AddFeatureFactors(ceres::Problem &problem) {
   }
 }
 void Estimator::solveOptimization() {
+  const auto problem_construction_start = std::chrono::steady_clock::now();
   ceres::Problem problem;
 
   AddPoseParameterBlocks(problem);
@@ -1203,6 +1411,14 @@ void Estimator::solveOptimization() {
   AddMarginalizationFactor(problem);
   AddIMUFactors(problem);
   AddFeatureFactors(problem);
+  frame_metrics_.problem_construction_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - problem_construction_start).count();
+  frame_metrics_.solver_parameter_blocks = std::max(
+      frame_metrics_.solver_parameter_blocks, problem.NumParameterBlocks());
+  frame_metrics_.solver_residual_blocks = std::max(
+      frame_metrics_.solver_residual_blocks, problem.NumResidualBlocks());
+  frame_metrics_.solver_residuals = std::max(
+      frame_metrics_.solver_residuals, problem.NumResiduals());
 
   ceres::Solver::Options ceres_options;
   ceres_options.linear_solver_type =
@@ -1214,7 +1430,19 @@ void Estimator::solveOptimization() {
                                 : options->max_solver_time();
 
   ceres::Solver::Summary summary;
+  const auto solver_start = std::chrono::steady_clock::now();
   ceres::Solve(ceres_options, &problem, &summary);
+  frame_metrics_.solver_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - solver_start).count();
+  if (frame_metrics_.solver_calls == 0) {
+    frame_metrics_.solver_initial_cost = summary.initial_cost;
+  }
+  ++frame_metrics_.solver_calls;
+  ++total_solver_calls_;
+  frame_metrics_.solver_iterations += static_cast<int>(summary.iterations.size());
+  frame_metrics_.solver_termination_type = static_cast<int>(summary.termination_type);
+  frame_metrics_.solver_solution_usable = summary.IsSolutionUsable();
+  frame_metrics_.solver_final_cost = summary.final_cost;
 }
 
 void Estimator::processOldMarginalization() {
@@ -1394,18 +1622,28 @@ std::unordered_map<long, double *> Estimator::createAddrShift(bool is_old) {
 }
 
 void Estimator::optimize() {
+  const auto parameter_preparation_start = std::chrono::steady_clock::now();
   prepareParameters();
+  frame_metrics_.parameter_preparation_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - parameter_preparation_start).count();
   solveOptimization();
+  const auto estimate_update_start = std::chrono::steady_clock::now();
   updateEstimates();
+  frame_metrics_.estimate_update_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - estimate_update_start).count();
   if (frameCount < WINDOW_SIZE) return;
+  const auto marginalization_start = std::chrono::steady_clock::now();
   if (isNewMarginalization()) {
     processNewMarginalization();
   } else {
     processOldMarginalization();
   }
+  frame_metrics_.marginalization_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - marginalization_start).count();
 }
 
 void Estimator::slideWindow() {
+  const auto slide_window_start = std::chrono::steady_clock::now();
   if (!isNewMarginalization()) {
     double t_0 = estimator_state[0].timestamp;
     back_state = estimator_state[0];
@@ -1413,6 +1651,8 @@ void Estimator::slideWindow() {
   } else {
     slideWindowNew();
   }
+  frame_metrics_.slide_window_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - slide_window_start).count();
 }
 
 void Estimator::slideWindowNew() {

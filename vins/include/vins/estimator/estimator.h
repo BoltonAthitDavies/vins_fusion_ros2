@@ -35,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <opencv2/core/eigen.hpp>
 #include <queue>
@@ -83,6 +84,37 @@ class Estimator {
   bool getkeyframePose(PoseData &data);
 
  private:
+  struct FrameMetrics {
+    double feature_queue_wait_ms = 0.0;
+    double imu_wait_ms = 0.0;
+    double imu_propagation_ms = 0.0;
+    double visual_update_ms = 0.0;
+    double initialization_ms = 0.0;
+    double triangulation_ms = 0.0;
+    double parameter_preparation_ms = 0.0;
+    double problem_construction_ms = 0.0;
+    double solver_ms = 0.0;
+    double estimate_update_ms = 0.0;
+    double marginalization_ms = 0.0;
+    double outlier_rejection_ms = 0.0;
+    double failure_detection_ms = 0.0;
+    double slide_window_ms = 0.0;
+    double state_output_ms = 0.0;
+    double estimator_update_ms = 0.0;
+    double pointcloud_ms = 0.0;
+    double backend_total_ms = 0.0;
+    int solver_calls = 0;
+    int solver_iterations = 0;
+    int solver_parameter_blocks = 0;
+    int solver_residual_blocks = 0;
+    int solver_residuals = 0;
+    int solver_termination_type = -1;
+    bool solver_solution_usable = false;
+    double solver_initial_cost = std::numeric_limits<double>::quiet_NaN();
+    double solver_final_cost = std::numeric_limits<double>::quiet_NaN();
+    std::size_t outliers_removed = 0;
+  };
+
   void initializeCamerasFromOptions();
   void processIMU(const IMUData &data, double deltaTime);
   void updateStateWithIMU(const IMUData &data, double deltaTime);
@@ -170,6 +202,8 @@ class Estimator {
   //
   std::queue<IMUData> imuBuffer;
   queue<TimestampedFeatureFrame> featureBuffer;
+  queue<std::chrono::steady_clock::time_point> featureEnqueueTimes;
+  queue<bool> featureFromExternalSource;
 
   Timestamp previousTimestamp = -1;
   Timestamp currentTimestamp = 0;
@@ -200,6 +234,8 @@ class Estimator {
   // the estimator reinitializes, so failed/recovered portions remain visible.
   std::atomic<std::size_t> total_images_received_{0};
   std::atomic<std::size_t> total_images_enqueued_{0};
+  std::atomic<std::size_t> total_image_frames_enqueued_{0};
+  std::atomic<std::size_t> total_external_feature_frames_{0};
   std::atomic<std::size_t> total_images_processed_{0};
   std::atomic<std::size_t> total_imu_received_{0};
   std::atomic<std::size_t> total_imu_used_{0};
@@ -209,11 +245,20 @@ class Estimator {
   std::atomic<std::size_t> imu_gap_resets_{0};
   std::atomic<std::size_t> failure_resets_{0};
   std::atomic<std::size_t> initialization_events_{0};
+  std::atomic<std::size_t> frontend_rows_{0};
+  std::atomic<std::size_t> backend_rows_{0};
+  std::atomic<std::size_t> total_solver_calls_{0};
+  std::atomic<std::size_t> total_outliers_removed_{0};
   Timestamp first_processed_timestamp_{-1.0};
   Timestamp first_initialized_timestamp_{-1.0};
   Timestamp last_processed_timestamp_{-1.0};
   std::ofstream performance_log_;
   std::ofstream events_log_;
+  std::ofstream frontend_log_;
+  std::ofstream backend_log_;
+  std::ofstream state_log_;
+  std::mutex frontend_log_mutex_;
+  FrameMetrics frame_metrics_;
   const std::chrono::steady_clock::time_point process_start_{
       std::chrono::steady_clock::now()};
 
