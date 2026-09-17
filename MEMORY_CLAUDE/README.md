@@ -6,7 +6,7 @@ background — the RY-SLAM paper, the model provenance, the detector node design
 the mask-coverage measurements and the environment/install notes. **Read that one
 first**; this file only records what is specific to VINS.
 
-Date: 2026-09-03. This package is a git submodule on branch `wil`, so these
+Date: 2026-09-03. Last updated: 2026-09-17. This package is a git submodule on branch `wil`, so these
 changes live in a separate repository from `orbslam3_ros2`.
 
 
@@ -198,3 +198,56 @@ Build from the **workspace root** (`colcon build --packages-select
 vins_fusion_ros2 --symlink-install`); running it from inside the package creates
 stray `build|install|log` dirs. Use `--parallel-workers 2` — a full-parallel build
 was killed by the OOM killer on this 15 GB box.
+
+
+## 8. Structured evaluation logging (implemented 2026-09-16)
+
+Passing the ROS parameter `output_path` now creates that directory and all missing
+parents automatically. It overrides the YAML output location, writes the trajectory
+to `<output_path>/vio.csv`, and uses `<output_path>/pose_graph/` as the default pose
+graph location. `pose_graph_save_path` can override the latter independently.
+
+Each completed raw run can contain:
+
+| file | evidence recorded |
+|---|---|
+| `run_metadata.csv` | pipeline, dataset/world paths, command notes, topics, frames, estimator settings and replay-rate label |
+| `frontend.csv` | KLT tracking time, mono/stereo feature counts, enqueue/backlog state and dynamic points removed |
+| `backend.csv` | initialization and marginalization state, stage timings, feature statistics, Ceres problem/solver statistics, bias norms and speed |
+| `estimator_state.csv` | per-frame position, orientation, velocity, IMU biases and time delay |
+| `performance.csv` | end-to-end processing, input/use counts, backlog, resets, CPU time and resident memory |
+| `events.csv` | startup, initialization, reset reason and graceful shutdown events |
+| `run_summary.csv` | run totals, initialization time, keyframes, resets, solver calls and outliers |
+| `filter_summary.csv` | whether filtering ran and its aggregate detection/mask/point-removal counts |
+| `yolo_mask.csv` | per-frame boxes, mask coverage, match age and rejected masks; created only when `filter:=true` |
+| `vio.csv` | estimated trajectory in the common comparison format |
+
+This is sufficient to analyse the VINS **frontend and sliding-window backend** as
+well as resource pressure and failure/reset behaviour. It does not provide
+loop-closure statistics because this repository contains no active `loop_fusion`
+component; this implementation is VIO rather than a complete loop-closing SLAM
+system. Do not present an absent loop-closure log as a zero loop-closure result.
+
+`replay_rate` and `world_path` in `run_metadata.csv` are provenance supplied by the
+launch command. They do not control rosbag playback or load a navigation map:
+`replay_rate` must match the actual `ros2 bag play --rate`, while `world_path`
+identifies the Gazebo world used to record the dataset. Stop the node gracefully
+where possible so summaries and buffered output are finalized.
+
+### Dataset-path provenance correction (2026-09-17)
+
+Dataset identity is determined by the containing dataset folder name, **not by old
+metadata**. The canonical storage locations for the relogged experiment are:
+
+* local: `dataset_dynamic_nofloortexture_01_000` and
+  `dataset_static_nofloortexture_001` under
+  `/home/ambushee/wil_project/dataset/`;
+* removable drive: every other `dataset_*_nofloortexture_*` used by this experiment
+  under `/media/ambushee/32E4AAB1E4AA772F/dataset/`.
+
+On 2026-09-17, all 66 `run_metadata.csv` files under `output/output_*` were audited
+against this rule. Fifteen incorrect `dataset_path` values were corrected (12 that
+incorrectly pointed local datasets to the drive and 3 that pointed
+`dataset_dynamic_nofloortexture_02_000` to a nonexistent local directory). All 66
+resolved paths existed after correction; trajectory and measurement files were not
+changed.
