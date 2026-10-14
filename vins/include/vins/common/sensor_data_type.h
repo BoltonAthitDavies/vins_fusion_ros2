@@ -80,11 +80,17 @@ struct ImageData : SensorDataBase {
   /// dynamic region and stops goodFeaturesToTrack seeding new ones there. Empty
   /// (the default) means no filtering -- the stock upstream behaviour.
   cv::Mat mask = cv::Mat();
+  /// Motion-gate census request (original image coordinates): after the backend
+  /// has processed this frame, Estimator reports per box how many tracked
+  /// features fell inside it and how many of those hold a solved depth in the
+  /// sliding window. Empty = no census, no cost.
+  std::vector<cv::Rect2f> vote_boxes;
   ImageData(const ImageData &other) {
     timestamp = other.timestamp;
     image0 = other.image0.clone();
     image1 = other.image1.clone();
     mask = other.mask.clone();
+    vote_boxes = other.vote_boxes;
   }
 
   ImageData &operator=(const ImageData &other) {
@@ -93,6 +99,7 @@ struct ImageData : SensorDataBase {
       image0 = other.image0.clone();
       image1 = other.image1.clone();
       mask = other.mask.clone();
+      vote_boxes = other.vote_boxes;
     }
     return *this;
   }
@@ -102,6 +109,7 @@ struct ImageData : SensorDataBase {
     image0 = std::move(other.image0);
     image1 = std::move(other.image1);
     mask = std::move(other.mask);
+    vote_boxes = std::move(other.vote_boxes);
   }
 
   ImageData &operator=(ImageData &&other) noexcept {
@@ -110,6 +118,7 @@ struct ImageData : SensorDataBase {
       image0 = std::move(other.image0);
       image1 = std::move(other.image1);
       mask = std::move(other.mask);
+      vote_boxes = std::move(other.vote_boxes);
     }
     return *this;
   }

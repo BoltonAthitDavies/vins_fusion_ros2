@@ -223,6 +223,7 @@ void Estimator::inputImage(const ImageData &image) {
       featureBuffer.push(make_pair(image.timestamp, featureFrame));
       featureEnqueueTimes.push(std::chrono::steady_clock::now());
       featureFromExternalSource.push(false);
+      voteBoxBuffer.push(image.vote_boxes);
       ++total_images_enqueued_;
       ++total_image_frames_enqueued_;
       enqueued = true;
@@ -276,6 +277,7 @@ void Estimator::inputFeature(double timestamp,
     featureBuffer.push(make_pair(timestamp, featureFrame));
     featureEnqueueTimes.push(std::chrono::steady_clock::now());
     featureFromExternalSource.push(true);
+    voteBoxBuffer.push(std::vector<cv::Rect2f>());
     ++total_images_enqueued_;
   }
   featureCondition.notify_one();
@@ -317,6 +319,7 @@ void Estimator::processMeasurements() {
     TimestampedFeatureFrame feature;
     std::chrono::steady_clock::time_point feature_enqueued_at;
     bool external_feature_source = false;
+    std::vector<cv::Rect2f> vote_boxes;
     vector<IMUData> imu_datas;
     {
       std::unique_lock<std::mutex> lock(featureBufferMutex);
@@ -336,6 +339,10 @@ void Estimator::processMeasurements() {
       if (!featureFromExternalSource.empty()) {
         external_feature_source = featureFromExternalSource.front();
         featureFromExternalSource.pop();
+      }
+      if (!voteBoxBuffer.empty()) {
+        vote_boxes = std::move(voteBoxBuffer.front());
+        voteBoxBuffer.pop();
       }
       lock.unlock();
     }
@@ -384,6 +391,7 @@ void Estimator::processMeasurements() {
       processImage(feature.second, feature.first);
       frame_metrics_.estimator_update_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - estimator_update_start).count();
+      if (!vote_boxes.empty()) censusBoxes(feature.second, vote_boxes, feature.first);
       const auto pointcloud_start = std::chrono::steady_clock::now();
       printStatistics(currentTimestamp);
       collectPointCloudAll(feature.first);
@@ -1840,6 +1848,41 @@ double Estimator::reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici,
   double rx = residual.x();
   double ry = residual.y();
   return sqrt(rx * rx + ry * ry);
+}
+
+void Estimator::censusBoxes(const FeatureFrame &frame,
+                            const std::vector<cv::Rect2f> &boxes, double timestamp) {
+  // Runs on the backend thread under processingMutex, right after the window
+  // was optimised and outliers purged for this frame -- the only moment the
+  // feature list and this frame's observations are both current.
+  std::unordered_set<int> solved;
+  for (const auto &f : featureManager.feature)
+    if (f.isSolved() && f.estimated_depth > 0) solved.insert(f.feature_id);
+
+  BoxCensus c;
+  c.timestamp = timestamp;
+  c.boxes.assign(boxes.size(), BoxVote());
+  for (const auto &kv : frame) {
+    if (kv.second.empty()) continue;
+    const auto &obs = kv.second.front().second;  // cam0: x y z u v vx vy
+    const cv::Point2f uv(static_cast<float>(obs(3)), static_cast<float>(obs(4)));
+    BoxVote *v = &c.background;
+    for (size_t j = 0; j < boxes.size(); ++j)
+      if (boxes[j].contains(uv)) { v = &c.boxes[j]; break; }
+    ++v->n_kp;
+    if (solved.count(kv.first)) ++v->n_inlier;
+  }
+  std::lock_guard<std::mutex> lk(censusMutex_);
+  censusOut_.push_back(std::move(c));
+  while (censusOut_.size() > 30) censusOut_.pop_front();
+}
+
+bool Estimator::takeBoxCensus(BoxCensus &out) {
+  std::lock_guard<std::mutex> lk(censusMutex_);
+  if (censusOut_.empty()) return false;
+  out = std::move(censusOut_.front());
+  censusOut_.pop_front();
+  return true;
 }
 
 void Estimator::outliersRejection(set<int> &removeIndex) {

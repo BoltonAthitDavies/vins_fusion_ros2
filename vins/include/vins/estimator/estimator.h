@@ -39,6 +39,8 @@
 #include <mutex>
 #include <opencv2/core/eigen.hpp>
 #include <queue>
+#include <deque>
+#include <unordered_set>
 #include <thread>
 
 using namespace std;
@@ -53,6 +55,25 @@ class Estimator {
   void inputIMU(const IMUData &imu);
   void inputFeature(Timestamp timestamp, const FeatureFrame &featureFrame);
   void inputImage(const ImageData &image);
+
+  /// Motion-gate census for one frame (see ImageData::vote_boxes). A feature is
+  /// an "inlier" when the sliding window holds a SOLVED, positive depth for it:
+  /// the VINS analogue of an ORB-SLAM3 keypoint whose map point survived pose
+  /// optimisation. Features on a moving object keep getting purged by
+  /// outliersRejection and re-enter as unsolved young tracks, so their box's
+  /// ratio sits well below the background's. Raw counts; the node decides.
+  struct BoxVote {
+    int n_kp = 0;
+    int n_inlier = 0;
+  };
+  struct BoxCensus {
+    double timestamp = 0.0;
+    std::vector<BoxVote> boxes;
+    BoxVote background;
+  };
+  /// Pops the oldest finished census, if any. Computed on the backend thread
+  /// right after processImage(), so it lags inputImage() by the backend queue.
+  bool takeBoxCensus(BoxCensus &out);
 
   /// Tracked points dropped so far because they landed on a dynamic region.
   /// featureTracker is private, and this is the only thing the node needs from
@@ -263,6 +284,13 @@ class Estimator {
       std::chrono::steady_clock::now()};
 
   FeatureManager featureManager;
+  // Motion gate: vote boxes travel in lockstep with featureBuffer; finished
+  // censuses wait here for the node.
+  std::queue<std::vector<cv::Rect2f>> voteBoxBuffer;
+  std::deque<BoxCensus> censusOut_;
+  std::mutex censusMutex_;
+  void censusBoxes(const FeatureFrame &frame, const std::vector<cv::Rect2f> &boxes,
+                   double timestamp);
   FeatureTracker featureTracker;
   MotionEstimator m_estimator;
   InitialEXRotation initial_ex_rotation;

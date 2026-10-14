@@ -251,3 +251,127 @@ incorrectly pointed local datasets to the drive and 3 that pointed
 `dataset_dynamic_nofloortexture_02_000` to a nonexistent local directory). All 66
 resolved paths existed after correction; trajectory and measurement files were not
 changed.
+
+## 9. Precomputed detections — `dets_csv` (2026-10-12)
+
+Same change as ORB-SLAM3 §12 (read that first: the lag mechanism, the 33 % vs
+91 % mask availability on two identical runs, and the stale-republisher trap are
+all documented there). VINS gained the identical parameter:
+
+- `dets_csv` (string, default empty). With `filter=true` and a file from
+  `script/yolo_precompute.py`, no detection subscription is created and
+  `maskFor()` looks each frame up by its exact header stamp (nearest within
+  `det_max_age` as a fallback, reported as a nonzero age). `loadDetsCsv()`,
+  `stampNs()` and the file branch mirror the ORB node line for line.
+- `filter_summary.csv` gains `detection_match_rate` and `detection_source`
+  (`none|live|file`); the 10 s wall-timer report now also warns when the match
+  rate drops below 98 %.
+
+Verification, `realistic_003`, `--rate 0.3`, 120 s wall, one fresh republisher
+pair, no stale processes:
+
+```
+yolo_mask.csv        676 frames, matched 676, det_age_ms 0.0 on every row
+filter_summary.csv   detection_match_rate 1.0000, detection_source file,
+                     dynamic_points_dropped 3360, masks_rejected 0
+Ceres "Uninitialized" lines   0
+```
+
+The first attempt at this check printed 1207 Ceres `Uninitialized` errors and
+every stamp three times. That was the harness, not VINS: two stale republishers
+from an earlier session plus the test's own pair delivered each frame twice,
+and `kill -9` on the `ros2 run` wrapper left the node binary alive to consume
+two further bag replays. VINS fed duplicate stamps (dt = 0) is what produces
+the Ceres spam. Kill by binary name (`pkill -f vins_fusion_ros2_nod[e]`,
+`pkill -f lib/image_transport/republis[h]`), never the wrapper.
+
+**What is and is not proven for VINS.** Mask determinism per frame is proven
+(file lookup, age 0, no detector). Frame-set determinism is NOT: VINS subscribes
+to raw `sensor_msgs/Image`, so its frames still arrive through a republisher
+pair over best-effort DDS — the same path ORB-SLAM3 §12.3 showed to lose frames
+nondeterministically. 676 frames in a 36 s window (~1080 published) is partly
+`image_skip` and partly that path. A two-run frame-set diff like ORB's has not
+been done for VINS; do it before quoting a VINS ON/OFF comparison, and if it
+fails, the fix is a reliable-QoS subscription or decoding compressed in the
+node as ORB does.
+
+## 10. Motion-gated masking — `filter_mode:=motion` (2026-10-12/14)
+
+Same policy, parameters, logs and calibration script as ORB-SLAM3 §13 — read
+that first. Only the census differs, because VINS has no per-frame
+pose-optimisation inlier flag:
+
+- `ImageData::vote_boxes` travels with the frame; `Estimator::inputImage`
+  pushes it in lockstep with `featureBuffer`, and `processMeasurements` runs
+  `censusBoxes()` right after `processImage()` on the backend thread — the only
+  moment the sliding-window feature list and this frame's observations are
+  both current.
+- A feature is an **inlier** when the window holds a SOLVED, positive depth for
+  it (`FeaturePerId::isSolved()`). Features on a mover keep being purged by
+  `outliersRejection` (reprojection error > 3 px over the window) and re-enter
+  as unsolved young tracks, so their box's ratio falls below the background's.
+  This is the VINS analogue of ORB's keyframe-anchored map point.
+- Finished censuses queue in `censusOut_`; the node drains them with
+  `takeBoxCensus()` at the start of `maskFor()` (`applyPendingVotes()`), so the
+  verdict lags by the backend queue depth, typically one frame.
+
+Not used, deliberately: `predictPtsInNextFrame()` / `setPrediction()` would give
+a direct predicted-vs-tracked residual per feature, but this fork never calls
+it, and enabling it changes KLT initialisation (`OPTFLOW_USE_INITIAL_FLOW`, one
+pyramid level) for the baseline too — it would contaminate the ON/OFF A/B.
+
+Verification is recorded below once the first motion run on `realistic_003`
+completes.
+
+### Verification — `realistic_003`, 2026-10-14 (`motion_20261014_01`)
+
+`dets_runs1.csv` (4-class), rate 0.3, `motion_min_points 15`, re-vote 15.
+1720 frames, match rate 1.0, 0 Ceres errors, 1518 tracked points culled.
+
+```
+yolo_mask.csv     292 of 1720 frames painted; box-frames moving 522, static 1916, unknown 5621
+truth / verdict   unknown   static   moving
+moving                556        2      181
+static               4106     1865      321
+none                  927       68       31
+census, voted rows (n_kp >= 15): moving n=15, static n=1319
+  box/bg inlier ratio   moving: p25 0.00 median 0.00 p90 0.48
+                        static: p10 0.79 median 1.15 p90 1.98
+sweep (recall / false alarm):
+  min_pts  8: ratio 0.25 0.63/0.027   0.50 0.75/0.041   0.75 0.89/0.098
+  min_pts 15: ratio 0.25 0.73/0.005   0.50 0.87/0.011   0.75 1.00/0.076
+```
+
+The census is strongly discriminative: a truly-moving box's solved-depth ratio
+is essentially zero (the mover's features never keep a consistent depth), a
+static box's sits at the background rate. At the run's parameters the per-vote
+recall is 0.87 for 1.1 % false alarm.
+
+The limiting factor is **coverage, not discrimination**: VINS tracks ~150–200
+features per frame, so only 1346 of 8057 box-frames reached 15 keypoints and
+70 % of box-frames stayed `unknown` (never scored, no chain to inherit from).
+Lowering `motion_min_points` to 8 quadruples the moving sample (15→73) at
+recall 0.75 / false alarm 4.1 %. The 321 static box-frames masked are mostly
+inherited from the few false votes and bounded by the re-vote probation.
+Only 15 truly-moving voted rows is a small sample; `realistic_002` (pallet
+jacks travelling 19 m) is the bag to confirm on.
+
+### Run 2 — `motion_20261014_04`, + `motion_min_box_age 30` (current defaults)
+
+```
+yolo_mask.csv     219 of 1719 frames painted; box-frames moving 394, static 1724, unknown 5931
+truth / verdict   unknown   static   moving
+moving                569        7      163     <- 22 % of moving box-frames masked
+static               4373     1697      218     <-  3.5 % of static box-frames masked
+census, voted rows (n_kp >= 15, box_age >= 30): moving n=16, static n=1295
+  box/bg inlier ratio   moving: median 0.00 p75 0.92     static: p10 0.82 median 1.15
+sweep: min_pts 15 ratio 0.50 -> recall 0.62 / false 0.8 %;  min_pts 8 -> 0.57 / 1.9 %
+```
+
+The gate is clean — under 1 % false alarm per vote, 3.5 % of static
+box-frames masked overall — and starved: 74 % of box-frames are never judged
+because VINS keeps ~150–200 features per frame and a box rarely holds 15 of
+them for a second. Only 16 truly-moving voted rows, so the recall figure is a
+small-sample estimate. Levers if resumed: `motion_min_points 8` (coverage ×3
+at 1.9 % false alarm), `max_cnt` in the VINS config (more features per frame),
+and `realistic_002` for a larger moving sample.

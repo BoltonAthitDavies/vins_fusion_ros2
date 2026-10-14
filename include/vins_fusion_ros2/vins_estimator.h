@@ -14,6 +14,7 @@
 #include <vision_msgs/msg/detection2_d_array.hpp>
 
 #include <deque>
+#include <map>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
@@ -49,7 +50,14 @@ class VinsEstimator : public rclcpp::Node {
       const vision_msgs::msg::Detection2DArray::ConstSharedPtr& msg);
   /// CV_8UC1 mask for a frame: 255 = keep, 0 = dynamic. Empty when filtering is
   /// off, no detection is recent enough, or the mask would blank too much.
-  cv::Mat maskFor(double t, const cv::Size& size);
+  cv::Mat maskFor(const builtin_interfaces::msg::Time& stamp, double t,
+                  const cv::Size& size);
+  /// Loads a script/yolo_precompute.py file into dets_file_ (see dets_csv).
+  void loadDetsCsv(const std::string& path);
+  static int64_t stampNs(const builtin_interfaces::msg::Time& t);
+  /// Motion gate: drain finished censuses from the estimator into verdicts.
+  void applyPendingVotes();
+  static double iou(const cv::Rect2f& a, const cv::Rect2f& b);
   /// One row per frame into yolo_mask.csv, next to vio.csv. Timestamp written as
   /// integer nanoseconds exactly as the trajectory is, so the two files join on
   /// column 0 with no tolerance fudging.
@@ -89,6 +97,9 @@ class VinsEstimator : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr dets_callback_group_;
   std::mutex dets_mu_;
   std::deque<std::pair<double, std::vector<cv::Rect2f>>> dets_;
+  /// Precomputed detections keyed by image header stamp (ns); empty = live mode.
+  std::string dets_csv_;
+  std::map<int64_t, std::vector<cv::Rect2f>> dets_file_;
   bool filter_ = false;
   int mask_dilate_px_ = 8;
   double det_max_age_ = 0.15;
@@ -102,8 +113,33 @@ class VinsEstimator : public rclcpp::Node {
     bool matched = false;
     double age_s = -1.0;
     bool rejected = false;
+    std::size_t n_moving = 0, n_static = 0, n_unknown = 0;
   };
   LogRow last_;
+  // Motion gate (same policy and parameters as the ORB-SLAM3 node). The census
+  // comes back from the backend thread; prev_votes_ is the newest scored frame,
+  // inflight_ holds boxes pushed but not yet scored, keyed by stamp.
+  static constexpr int VERDICT_UNKNOWN = 0, VERDICT_STATIC = 1, VERDICT_MOVING = 2;
+  struct VotedBox {
+    cv::Rect2f box;
+    int verdict = VERDICT_UNKNOWN;
+    int since_vote = 0;  ///< frames since this chain was last actually scored
+    int chain_age = 0;   ///< frames this box has been associated through
+  };
+  std::string filter_mode_{"class"};
+  double motion_iou_ = 0.3;
+  int motion_min_points_ = 15;
+  double motion_inlier_ratio_ = 0.5;
+  bool motion_unknown_mask_ = false;
+  int motion_revote_frames_ = 15;
+  int motion_min_box_age_ = 30;
+  std::mutex votes_mu_;
+  std::vector<VotedBox> prev_votes_;
+  std::map<double, std::vector<VotedBox>> inflight_;
+  std::vector<cv::Rect2f> vote_boxes_;
+  std::ofstream votes_log_;
+  std::size_t boxes_voted_moving_ = 0;
+  std::size_t boxes_voted_static_ = 0;
   double last_age_ = -1.0;
   std::ofstream mask_log_;
   std::string output_path_;

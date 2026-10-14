@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <sstream>
 #include <opencv2/imgproc.hpp>
 #include <rcpputils/filesystem_helper.hpp>
 #include <stdexcept>
@@ -41,6 +42,16 @@ void VinsEstimator::reportFilter() {
                 "detector node running, and is det_max_age (%.0f ms) long enough "
                 "for its inference time?",
                 det_max_age_ * 1e3);
+  } else if (det_matched_ < (det_matched_ + det_missed_) * 98 / 100) {
+    // The quiet failure: nothing crashed, the trajectory looks fine, and the
+    // filter was off for a chunk of the run.
+    RCLCPP_WARN(this->get_logger(),
+                "only %.1f%% of frames (%zu of %zu) had a detection to mask "
+                "with; the filter is effectively OFF for the rest and this run "
+                "is NOT comparable with filter:=false. Precompute with "
+                "script/yolo_precompute.py and pass dets_csv.",
+                100.0 * det_matched_ / (det_matched_ + det_missed_),
+                det_matched_, det_matched_ + det_missed_);
   }
 }
 
@@ -52,6 +63,15 @@ VinsEstimator::~VinsEstimator() {
           << "filter_enabled," << (filter_ ? 1 : 0) << '\n'
           << "detection_frames_matched," << det_matched_ << '\n'
           << "detection_frames_missed," << det_missed_ << '\n'
+          << "detection_match_rate," << std::fixed << std::setprecision(4)
+          << (det_matched_ + det_missed_
+                  ? static_cast<double>(det_matched_) / (det_matched_ + det_missed_)
+                  : 0.0) << '\n'
+          << "detection_source,"
+          << (!filter_ ? "none" : dets_csv_.empty() ? "live" : "file") << '\n'
+          << "filter_mode," << (filter_ ? filter_mode_ : "none") << '\n'
+          << "boxes_voted_moving," << boxes_voted_moving_ << '\n'
+          << "boxes_voted_static," << boxes_voted_static_ << '\n'
           << "masks_rejected," << mask_rejected_ << '\n'
           << "dynamic_points_dropped," << estimator_->dynamicDroppedPoints() << '\n';
     }
@@ -129,6 +149,32 @@ void VinsEstimator::initializeParamters() {
   // all-255 path -- the stock tracker, bit for bit, and the recorded baseline
   // stays reproducible.
   filter_ = readParam<bool>(this, "filter", false);
+  // Precomputed detections (script/yolo_precompute.py). When set, no detector
+  // subscription is created: each frame's boxes are looked up by its OWN header
+  // stamp, so two runs of one bag mask identical frames with identical boxes.
+  // The live path depends on the detector staying within det_max_age of the
+  // tracker, which on this laptop varied from 33% to 91% of frames with the
+  // machine's temperature.
+  dets_csv_ = readParam<std::string>(this, "dets_csv", "");
+  // "class": every detected box is masked. "motion": a box is masked only once
+  // the estimator has seen it move -- scored after the backend processes the
+  // frame (features inside the box holding a solved depth, against the
+  // background rate), and later frames inherit the verdict by IoU. A masked box
+  // has no features to re-vote, so "moving" sticks until the detection chain
+  // breaks. Parameters and semantics are identical to the ORB-SLAM3 node.
+  filter_mode_ = readParam<std::string>(this, "filter_mode", "class");
+  if (filter_mode_ != "class" && filter_mode_ != "motion")
+    throw std::runtime_error("filter_mode must be 'class' or 'motion'");
+  motion_iou_ = readParam<double>(this, "motion_iou", 0.3);
+  motion_min_points_ = readParam<int>(this, "motion_min_points", 15);
+  motion_inlier_ratio_ = readParam<double>(this, "motion_inlier_ratio", 0.5);
+  motion_unknown_mask_ = readParam<bool>(this, "motion_unknown_mask", false);
+  // Every N-th frame of a "moving" chain is left unpainted so it can be
+  // re-scored; without this one false vote spreads and sticks (see ORB node).
+  motion_revote_frames_ = readParam<int>(this, "motion_revote_frames", 15);
+  // Judge a box only once its association chain is this old (frames): a mover
+  // and a just-revealed static object look alike for the first second.
+  motion_min_box_age_ = readParam<int>(this, "motion_min_box_age", 30);
   mask_dilate_px_ = readParam<int>(this, "mask_dilate_px", 8);
   det_max_age_ = readParam<double>(this, "det_max_age", 0.15);
   // Measured on dataset/dynamic_dataset: dilated boxes cover mean 43.5% of the
@@ -170,6 +216,14 @@ void VinsEstimator::initializeParamters() {
         {"det_max_age_s", std::to_string(det_max_age_)},
         {"mask_dilate_px", std::to_string(mask_dilate_px_)},
         {"max_mask_fraction", std::to_string(max_mask_fraction_)},
+        {"dets_csv", dets_csv_},
+        {"filter_mode", filter_mode_},
+        {"motion_iou", std::to_string(motion_iou_)},
+        {"motion_min_points", std::to_string(motion_min_points_)},
+        {"motion_inlier_ratio", std::to_string(motion_inlier_ratio_)},
+        {"motion_unknown_mask", motion_unknown_mask_ ? "true" : "false"},
+        {"motion_revote_frames", std::to_string(motion_revote_frames_)},
+        {"motion_min_box_age", std::to_string(motion_min_box_age_)},
         {"start_wall_time_unix_ns", std::to_string(
              std::chrono::duration_cast<std::chrono::nanoseconds>(
                  std::chrono::system_clock::now().time_since_epoch()).count())}};
@@ -186,11 +240,21 @@ void VinsEstimator::initializeParamters() {
     const std::string p = options->OUTPUT_FOLDER + "/yolo_mask.csv";
     mask_log_.open(p);
     if (mask_log_) {
-      mask_log_ << "timestamp_ns,n_boxes,mask_coverage,matched,det_age_ms,rejected\n";
+      mask_log_ << "timestamp_ns,n_boxes,mask_coverage,matched,det_age_ms,rejected,"
+                   "n_moving,n_static,n_unknown\n";
       RCLCPP_INFO(this->get_logger(), "mask log -> %s", p.c_str());
     } else {
       RCLCPP_WARN(this->get_logger(), "could not open %s", p.c_str());
     }
+    if (filter_mode_ == "motion") {
+      // One row per box per scored frame: the raw census and the verdict. This
+      // is what calibrates motion_inlier_ratio against pose/info.
+      votes_log_.open(options->OUTPUT_FOLDER + "/motion_votes.csv");
+      if (votes_log_)
+        votes_log_ << "timestamp_ns,box,x0,y0,x1,y1,n_kp,n_inlier,bg_kp,bg_inlier,"
+                      "inherited,verdict,box_age\n";
+    }
+    RCLCPP_INFO(this->get_logger(), "filter mode: %s", filter_mode_.c_str());
   }
 
   estimator_->initialize(options);
@@ -256,7 +320,9 @@ void VinsEstimator::initializeSubscribers() {
           ImageData image;
           image.image0 = fromMsg(*msg);
           image.timestamp = fromMsg(msg->header.stamp);
-          image.mask = maskFor(image.timestamp, image.image0.size());
+          image.mask = maskFor(msg->header.stamp, image.timestamp,
+                               image.image0.size());
+          image.vote_boxes = vote_boxes_;
           logMask(msg->header.stamp);
           estimator_->inputImage(image);
         },
@@ -267,19 +333,29 @@ void VinsEstimator::initializeSubscribers() {
   if (filter_) {
     dets_callback_group_ =
         this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    rclcpp::SubscriptionOptions sub_opt_dets;
-    sub_opt_dets.callback_group = dets_callback_group_;
     auto dets_topic =
         readParam<std::string>(this, "dynamic_dets_topic", "/orbslam3/dynamic_dets");
-    dets_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
-        dets_topic, rclcpp::SensorDataQoS(),
-        std::bind(&VinsEstimator::onDetections, this, std::placeholders::_1),
-        sub_opt_dets);
-    RCLCPP_INFO(this->get_logger(),
-                "filter: ON -- masking dynamic objects from %s (dilate %d px, "
-                "max age %.0f ms, max coverage %.0f%%)",
-                dets_topic.c_str(), mask_dilate_px_, det_max_age_ * 1e3,
-                max_mask_fraction_ * 100.0);
+    if (!dets_csv_.empty()) {
+      loadDetsCsv(dets_csv_);
+      RCLCPP_INFO(this->get_logger(),
+                  "filter: ON -- masking from precomputed %s (dilate %d px, "
+                  "exact-stamp lookup, nearest within %.0f ms as fallback, max "
+                  "coverage %.0f%%)",
+                  dets_csv_.c_str(), mask_dilate_px_, det_max_age_ * 1e3,
+                  max_mask_fraction_ * 100.0);
+    } else {
+      rclcpp::SubscriptionOptions sub_opt_dets;
+      sub_opt_dets.callback_group = dets_callback_group_;
+      dets_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
+          dets_topic, rclcpp::SensorDataQoS(),
+          std::bind(&VinsEstimator::onDetections, this, std::placeholders::_1),
+          sub_opt_dets);
+      RCLCPP_INFO(this->get_logger(),
+                  "filter: ON -- masking dynamic objects from %s (dilate %d px, "
+                  "max age %.0f ms, max coverage %.0f%%)",
+                  dets_topic.c_str(), mask_dilate_px_, det_max_age_ * 1e3,
+                  max_mask_fraction_ * 100.0);
+    }
   } else {
     RCLCPP_INFO(this->get_logger(),
                 "filter: off (stock VINS feature tracking)");
@@ -327,7 +403,8 @@ void VinsEstimator::stereoCallback(
   image.image0 = fromMsg(*img0);
   image.image1 = fromMsg(*img1);
   image.timestamp = fromMsg(img0->header.stamp);
-  image.mask = maskFor(image.timestamp, image.image0.size());
+  image.mask = maskFor(img0->header.stamp, image.timestamp, image.image0.size());
+  image.vote_boxes = vote_boxes_;
   logMask(img0->header.stamp);
   estimator_->inputImage(image);
 }
@@ -351,11 +428,82 @@ void VinsEstimator::onDetections(
   while (dets_.size() > 60) dets_.pop_front();
 }
 
-cv::Mat VinsEstimator::maskFor(double t, const cv::Size& size) {
+int64_t VinsEstimator::stampNs(const builtin_interfaces::msg::Time& t) {
+  return static_cast<int64_t>(t.sec) * 1000000000LL +
+         static_cast<int64_t>(t.nanosec);
+}
+
+void VinsEstimator::loadDetsCsv(const std::string& path) {
+  // script/yolo_precompute.py format: '#' provenance lines, a header, then one
+  // row per box as timestamp_ns,class,score,x0,y0,x1,y1. A frame with nothing
+  // detected is present with an empty class, so "no boxes" and "frame not in
+  // file" stay distinguishable -- only the latter counts as missed.
+  std::ifstream in(path);
+  if (!in) throw std::runtime_error("dets_csv: cannot open " + path);
+  std::string line;
+  std::size_t n_boxes = 0;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#' || line.rfind("timestamp_ns", 0) == 0)
+      continue;
+    std::stringstream ss(line);
+    std::string f[7];
+    int i = 0;
+    while (i < 7 && std::getline(ss, f[i], ',')) ++i;
+    if (i < 7) continue;
+    auto& v = dets_file_[std::stoll(f[0])];
+    if (f[1].empty()) continue;
+    const float x0 = std::stof(f[3]), y0 = std::stof(f[4]);
+    const float x1 = std::stof(f[5]), y1 = std::stof(f[6]);
+    if (x1 > x0 && y1 > y0) {
+      v.emplace_back(x0, y0, x1 - x0, y1 - y0);
+      ++n_boxes;
+    }
+  }
+  if (dets_file_.empty()) throw std::runtime_error("dets_csv: no frames in " + path);
+  RCLCPP_INFO(this->get_logger(),
+              "dets_csv: %zu frames, %zu boxes (%.2f per frame) from %s",
+              dets_file_.size(), n_boxes,
+              static_cast<double>(n_boxes) / dets_file_.size(), path.c_str());
+}
+
+cv::Mat VinsEstimator::maskFor(const builtin_interfaces::msg::Time& stamp,
+                               double t, const cv::Size& size) {
+  // Always reset: a frame with no detection must not inherit the previous
+  // frame's vote boxes, or its census would be charged to the wrong boxes.
+  vote_boxes_.clear();
   if (!filter_) return cv::Mat();
+  if (filter_mode_ == "motion") applyPendingVotes();
 
   std::vector<cv::Rect2f> boxes;
-  {
+  if (!dets_file_.empty()) {
+    // Precomputed: the frame's own stamp, exactly. The nearest-within-tolerance
+    // fallback exists for a re-stamped replay and reports a nonzero age so a
+    // run that needed it is visible in yolo_mask.csv.
+    const int64_t ns = stampNs(stamp);
+    auto it = dets_file_.find(ns);
+    double age = 0.0;
+    if (it == dets_file_.end()) {
+      auto up = dets_file_.lower_bound(ns);
+      double best = det_max_age_;
+      for (auto cand : {up, up == dets_file_.begin() ? dets_file_.end()
+                                                      : std::prev(up)}) {
+        if (cand == dets_file_.end()) continue;
+        const double a = std::fabs(static_cast<double>(cand->first - ns)) * 1e-9;
+        if (a <= best) {
+          best = a;
+          it = cand;
+        }
+      }
+      if (it == dets_file_.end()) {
+        ++det_missed_;
+        last_ = LogRow{0, 0.0, false, -1.0, false};
+        return cv::Mat();
+      }
+      age = best;
+    }
+    boxes = it->second;
+    last_age_ = age;
+  } else {
     std::lock_guard<std::mutex> lk(dets_mu_);
     double best = det_max_age_;
     const std::vector<cv::Rect2f>* pick = nullptr;
@@ -376,10 +524,53 @@ cv::Mat VinsEstimator::maskFor(double t, const cv::Size& size) {
   }
   ++det_matched_;
 
+  // Motion gate: decide which boxes get painted, remember all of them (with
+  // inherited verdicts) for the census, and hand the full list to the estimator.
+  std::size_t n_moving = 0, n_static = 0, n_unknown = 0;
+  if (filter_mode_ == "motion") {
+    std::vector<VotedBox> now;
+    now.reserve(boxes.size());
+    {
+      std::lock_guard<std::mutex> lk(votes_mu_);
+      for (const auto& b : boxes) {
+        int verdict = VERDICT_UNKNOWN;
+        int since = 0, age = 0;
+        double best = motion_iou_;
+        for (const auto& pv : prev_votes_) {
+          const double o = iou(b, pv.box);
+          if (o >= best) {
+            best = o;
+            verdict = pv.verdict;
+            since = pv.since_vote + 1;
+            age = pv.chain_age + 1;
+          }
+        }
+        now.push_back(VotedBox{b, verdict, since, age});
+      }
+      inflight_.emplace(t, now);
+      while (inflight_.size() > 30) inflight_.erase(inflight_.begin());
+    }
+    std::vector<cv::Rect2f> painted;
+    for (const auto& vb : now) {
+      vote_boxes_.push_back(vb.box);
+      if (vb.verdict == VERDICT_MOVING) {
+        ++n_moving;
+        const bool revote = motion_revote_frames_ > 0 && vb.since_vote >= motion_revote_frames_;
+        if (!revote) painted.push_back(vb.box);
+      } else if (vb.verdict == VERDICT_STATIC) {
+        ++n_static;
+      } else {
+        ++n_unknown;
+        if (motion_unknown_mask_) painted.push_back(vb.box);
+      }
+    }
+    boxes.swap(painted);
+  }
+
   // A real "nothing dynamic here" answer. An empty Mat is both correct and
   // cheaper than an all-255 one: setMask() then takes its original path.
   if (boxes.empty()) {
-    last_ = LogRow{0, 0.0, true, last_age_, false};
+    last_ = LogRow{0, 0.0, true, last_age_, false, n_moving, n_static, n_unknown};
     return cv::Mat();
   }
 
@@ -401,7 +592,7 @@ cv::Mat VinsEstimator::maskFor(double t, const cv::Size& size) {
   const double fraction = dynamic_area / static_cast<double>(size.area());
   if (fraction > max_mask_fraction_) {
     ++mask_rejected_;
-    last_ = LogRow{boxes.size(), fraction, true, last_age_, true};
+    last_ = LogRow{boxes.size(), fraction, true, last_age_, true, n_moving, n_static, n_unknown};
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "dynamic mask would cover %.0f%% of the frame (limit "
                          "%.0f%%) -- ignoring it for this frame rather than "
@@ -409,19 +600,61 @@ cv::Mat VinsEstimator::maskFor(double t, const cv::Size& size) {
                          fraction * 100.0, max_mask_fraction_ * 100.0);
     return cv::Mat();
   }
-  last_ = LogRow{boxes.size(), fraction, true, last_age_, false};
+  last_ = LogRow{boxes.size(), fraction, true, last_age_, false, n_moving, n_static, n_unknown};
   return mask;
+}
+
+double VinsEstimator::iou(const cv::Rect2f& a, const cv::Rect2f& b) {
+  const float inter = (a & b).area();
+  const float uni = a.area() + b.area() - inter;
+  return uni > 0.f ? inter / uni : 0.0;
+}
+
+void VinsEstimator::applyPendingVotes() {
+  Estimator::BoxCensus c;
+  while (estimator_->takeBoxCensus(c)) {
+    std::lock_guard<std::mutex> lk(votes_mu_);
+    auto it = inflight_.find(c.timestamp);
+    if (it == inflight_.end()) continue;
+    std::vector<VotedBox> voted = it->second;
+    inflight_.erase(inflight_.begin(), std::next(it));
+    const double bg_ratio = c.background.n_kp > 0
+        ? static_cast<double>(c.background.n_inlier) / c.background.n_kp : 0.0;
+    const int64_t ns = static_cast<int64_t>(std::llround(c.timestamp * 1e9));
+    for (std::size_t j = 0; j < voted.size() && j < c.boxes.size(); ++j) {
+      const int n_kp = c.boxes[j].n_kp, n_in = c.boxes[j].n_inlier;
+      const int inherited = voted[j].verdict;
+      if (n_kp >= motion_min_points_ && voted[j].chain_age >= motion_min_box_age_) {
+        const double ratio = static_cast<double>(n_in) / n_kp;
+        voted[j].verdict =
+            ratio < motion_inlier_ratio_ * bg_ratio ? VERDICT_MOVING : VERDICT_STATIC;
+        voted[j].since_vote = 0;
+      }
+      if (voted[j].verdict == VERDICT_MOVING) ++boxes_voted_moving_;
+      else if (voted[j].verdict == VERDICT_STATIC) ++boxes_voted_static_;
+      if (votes_log_) {
+        const auto& b = voted[j].box;
+        votes_log_ << ns << ',' << j << ',' << std::fixed << std::setprecision(1) << b.x
+                   << ',' << b.y << ',' << b.x + b.width << ',' << b.y + b.height << ','
+                   << n_kp << ',' << n_in << ',' << c.background.n_kp << ','
+                   << c.background.n_inlier << ',' << inherited << ',' << voted[j].verdict
+                   << ',' << voted[j].chain_age << '\n';
+      }
+    }
+    if (votes_log_) votes_log_.flush();
+    prev_votes_.swap(voted);
+  }
 }
 
 void VinsEstimator::logMask(const builtin_interfaces::msg::Time& stamp) {
   if (!mask_log_) return;
-  const int64_t ns = static_cast<int64_t>(stamp.sec) * 1000000000LL +
-                     static_cast<int64_t>(stamp.nanosec);
+  const int64_t ns = stampNs(stamp);
   mask_log_ << ns << ',' << last_.n_boxes << ','
             << std::fixed << std::setprecision(4) << last_.coverage << ','
             << (last_.matched ? 1 : 0) << ',' << std::setprecision(1)
             << (last_.age_s < 0 ? -1.0 : last_.age_s * 1e3) << ','
-            << (last_.rejected ? 1 : 0) << '\n';
+            << (last_.rejected ? 1 : 0) << ',' << last_.n_moving << ','
+            << last_.n_static << ',' << last_.n_unknown << '\n';
   // Flush every row: this node's executor does not reliably return from spin()
   // on SIGINT, so the destructor cannot be trusted to close the stream and the
   // final line would be left truncated.
