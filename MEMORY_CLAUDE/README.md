@@ -252,7 +252,21 @@ incorrectly pointed local datasets to the drive and 3 that pointed
 resolved paths existed after correction; trajectory and measurement files were not
 changed.
 
-## 9. Precomputed detections — `dets_csv` (2026-10-12)
+## 9. Precomputed detections — IMPLEMENTED, THEN REMOVED (2026-10-12 to 10-16)
+
+> **REMOVED 2026-10-16**, see ORB record §12 for the reason: Experiment 3 is a
+> deployment evaluation at replay rate 1.0, so the live detector is part of the
+> system under test. Diff preserved at
+> `MEMORY_CLAUDE/precompute_and_fixes_2026-10-16.patch`.
+>
+> KEPT: `filter_status` in `filter_summary.csv`, the 20 s watchdog that ERRORs
+> when nothing publishes the detection topic, and the
+> `dynamic_points_dropped` / `mindistance_points_dropped` split. Those exist
+> because of the 2026-09-16 failure recorded below, which the live path can
+> still reproduce.
+
+### Original section (historical)
+
 
 Same change as ORB-SLAM3 §12 (read that first: the lag mechanism, the 33 % vs
 91 % mask availability on two identical runs, and the stale-republisher trap are
@@ -375,3 +389,205 @@ them for a second. Only 16 truly-moving voted rows, so the recall figure is a
 small-sample estimate. Levers if resumed: `motion_min_points 8` (coverage ×3
 at 1.9 % false alarm), `max_cnt` in the VINS config (more features per frame),
 and `realistic_002` for a larger moving sample.
+
+## 11. The motion census does not work, and why (2026-10-15) — NEGATIVE RESULT
+
+Everything in §10 is implemented and runs. On `dataset_dynamic_nofloortexture_00_000`
+it does not detect motion. Four diagnostics, in order, each ruling out the
+explanation the previous one suggested. **Read this before attempting a fifth.**
+
+Ground truth throughout is `script/motion_votes_eval.py`, which projects the
+props into cam0 and labels each voted box moving/static from `pose/info` speed.
+On this bag **64 % of box-frames sit on genuinely moving objects**, so the
+scene is not the problem.
+
+### 11.1 The headline
+
+| census | signal | result |
+|---|---|---|
+| solved depth (§10) | feature holds a solved, positive depth in the window | moving and static indistinguishable |
+| reprojection residual | median `ave_err × FOCAL_LENGTH` per box vs background | **inverted** — movers score LOWER |
+| residual availability | fraction of a box's features that have a residual at all | recall 0.56 at 41 % false alarm |
+
+### 11.2 Solved depth: measures depth observability, not motion
+
+At the shipped defaults, against truth:
+
+```
+truth / verdict   unknown   static   moving
+moving               1558      180      216     <- catches 11 % of truly-moving box-frames
+static                605       54       56
+voted rows:  moving n=84  median ratio 1.66     static n=26  median 1.93
+             recall 0.250   false alarm 0.231   (chance)
+```
+
+Starvation was suspected first — the median box held **3** tracked features of
+the 150 VINS keeps. Two config experiments settled it:
+
+- `max_cnt 150 → 250`: **no effect**. `feature_count` went 150 → 147; the scene
+  cannot supply more corners ≥30 px apart. Per-box distribution identical
+  (median 3, p75 6, p90 16), `processing_ms` 55.7 → 57.2. The ceiling is
+  `min_dist`, not `max_cnt`.
+- `min_dist 30 → 15` (with `max_cnt 250`): features per box 3 → **12**, coverage
+  19.6 % → 55.8 %. And the signal *vanished*: **94.7 %** of features inside
+  moving objects held solved depths, box/background ratio min **0.96**, median
+  2.03, and **zero** of 83 voted rows fell below the threshold.
+
+More data made it worse, which is the signature of a quantity that was never
+measuring the right thing. A moving point triangulates perfectly well — it
+converges to the WRONG depth, and `isSolved()` cannot tell the difference.
+
+### 11.3 Reprojection residual: confounded by survivorship
+
+`outliersRejection()` already computes each feature's average reprojection
+residual against the optimised window, uses it as a >3 px cutoff, and discards
+it. Capturing it before the purge looked like the obvious fix. Measured:
+
+```
+box/bg residual   moving n=31  median 0.57      static n=37  median 1.22
+sweep (moving if ABOVE):  1.5 -> recall 0.226 / false 0.270
+background median residual 1.915 px;  n_resid median 1
+```
+
+Movers score **lower**. `outliersRejection` purges >3 px features every frame,
+so a mover's bad features are gone within a frame or two and only the ones that
+happened to fit remain to be measured. Inverting the rule does not rescue it:
+31 moving samples, and the mechanism is a selection artifact, not a property of
+motion. The same effect caps coverage — a residual needs `used_num >= 4` and a
+mover's features rarely survive that long.
+
+### 11.4 Residual availability: also no
+
+If movers lose features before they reach four observations, the *fraction* of a
+box's features that have a residual should itself be the signal. It is not:
+`n_resid/n_kp` medians 0.14 (moving) vs 0.27 (static), sweep gives recall 0.56
+at **41 %** false alarm.
+
+### 11.5 The common cause
+
+All three read the BACKEND: the sliding window after optimisation and outlier
+rejection. VINS is *designed* to be robust to moving points — it purges anything
+over 3 px every frame and `featureManager` keeps only survivors. **By the time
+the window has an opinion about a feature, the features that disagreed with it
+are gone.** Asking the filter that removes movers to report where the movers are
+cannot work, whichever statistic is used.
+
+### 11.6 A trap in comparing runs
+
+The residual run's solved-depth block scored recall 0.738 (0.930 at
+`min_points 15`) against 0.250 for the earlier run at the *same* `max_cnt` and
+`min_dist`. **That is not an improvement.** The two runs used different decision
+rules, so they masked different boxes, so the surviving feature population
+differed, so the census differed. A census computed downstream of its own
+masking is not comparable across policies. Two earlier figures were quoted in
+this record before ground truth saw them and did not survive more data
+(`realistic_003` "recall 0.62 / 0.8 %" rested on 16 samples); do not quote a
+threshold or a rate until `motion_votes_eval.py` has scored it.
+
+### 11.7 If it is resumed: use the frontend
+
+The signal must be computed BEFORE rejection. Three things already exist and are
+unused:
+
+- **`FeatureTracker::rejectWithF()`** — written, and commented out at
+  `vins/src/featureTracker/feature_tracker.cpp:297`. RANSAC fundamental matrix
+  between consecutive frames; the outliers it marks are points violating
+  epipolar geometry, i.e. points that moved. Pre-rejection, every tracked point,
+  every frame. Cheapest honest attempt remaining.
+- **`Estimator::predictPtsInNextFrame()` / `FeatureTracker::setPrediction()`** —
+  implemented at `vins/src/estimator/estimator.cpp:1807`, never called.
+  Predicted-vs-tracked displacement per feature. Must be computed WITHOUT
+  calling `setPrediction`, which changes KLT initialisation
+  (`OPTFLOW_USE_INITIAL_FLOW`, one pyramid level) and would contaminate the
+  baseline.
+- **`ptsVelocity()`** — per-point image velocity, computed every frame and
+  already carried in the feature message as `vx, vy`. Ego-motion is a smooth
+  field; a mover is a coherent local anomaly in it. No new computation.
+
+ORB-SLAM3's gate is also weak (record §13: recall 0.43 at 5 % false alarm), so
+this is not a VINS-specific verdict on motion gating as an idea.
+
+### 11.8 Status
+
+The §10 implementation is reverted to the solved-depth census and remains in the
+tree, off by default (`filter_mode: class`). Experiment 3 runs on `class` mode,
+which is the RY-SLAM method the thesis tests; motion gating belongs in Chapter 5
+as attempted-and-failed, with the measurements above as its evidence.
+
+Kept from the same day and NOT part of this rewrite: `dets_csv` auto-discovery,
+`filter_status`, the detector watchdog, and the
+`dynamic_points_dropped`/`mindistance_points_dropped` split.
+
+
+## 12. One-command launch — `launch/wil_sim_vins_filter.launch.py` (2026-10-16)
+
+A filter run took four terminals in the right order, and forgetting the detector
+is SILENT -- the node subscribes, nothing publishes, every frame records
+matched=0. That is the 2026-09-16 failure (§9) and it recurred on 2026-10-15/16
+once the precompute shortcut was removed.
+
+**Cross-package reference, deliberate.** `dynamic_detector_node.py` lives in the
+workspace sibling `orbslam3_ros2`, and this package is a submodule. That is why
+it shipped no WiL launch file for so long, and why this one first lived in
+`script/` and was launched by absolute path. Moved into `launch/` on 2026-10-16
+at the user's request, so it is reachable as `ros2 launch vins_fusion_ros2 ...`
+exactly like the ORB one. `orbslam3_ros2` is referenced BY PACKAGE NAME,
+resolved through the ament index at launch time, and is deliberately NOT
+declared in package.xml: `colcon build` of this submodule alone still succeeds,
+and only `filter:=true` needs the sibling present. With `filter:=false` there is
+no cross-package reference at all. If this submodule is ever reused outside this
+workspace, this is the one file to delete.
+
+```bash
+ros2 launch vins_fusion_ros2 wil_sim_vins_filter.launch.py \
+  output_path:=.../output_vins_yolo/simulation/<bag>/<run-id> \
+  experiment_id:=<run-id> dataset_path:=<bag> world_path:=<world>
+# bag in one other terminal:  ros2 bag play <bag> --rate 1.0
+```
+
+It starts the detector (only when `filter:=true`) and the estimator — so both
+are up before playback rather than the detector joining halfway through. Since
+§13 both read the compressed topics directly, so no republish helpers are
+started; `republish:=true` restores them for a raw-only source. `filter:=false` gives the baseline
+arm with no detector process at all, which is the correct control for a
+deployment comparison. Free-text parameters are pinned with
+`ParameterValue(..., value_type=str)`; without that a `run_notes` containing a
+colon-space is YAML-parsed into a dict and aborts the launch.
+
+`replay_rate` remains metadata only — nothing enforces it, and a wrong value
+survived twelve September manifests. Verify it afterwards from the IMU arrival
+rate in `performance.csv` against the bag's nominal rate.
+
+## 13. In-process compressed images — no republish helpers (2026-10-16)
+
+VINS subscribed only to raw `sensor_msgs/Image`, but every bag in this project
+carries **only** `/camN/image_raw/compressed`. The gap was bridged by two
+`image_transport republish` processes, which cost three documented failures:
+
+- **loss**: raw 1280x720 rgb8 is 2.7 MB per message over best-effort DDS. Two
+  identical ORB runs received 919 and 813 frames of the same window with
+  `queue_dropped = 0` -- 394 stamps present in only one run;
+- **duplication**: two republisher pairs on one topic deliver every frame twice.
+  VINS fed duplicate stamps (dt = 0) emits Ceres "Uninitialized" errors; one run
+  logged 1 207 of them and every census row three times;
+- **staleness**: a pair left running from an earlier session silently feeds
+  later runs. Two from 13:34 were still alive at 16:25 on 2026-10-12 and had
+  fed every ORB run in between.
+
+`image_transport` parameter, `raw` (default) or `compressed`. With `compressed`
+the node subscribes to `<image0_topic>/compressed` through a second
+`ApproximateTime` sync over `CompressedImage` and decodes with `cv::imdecode`
+straight to **grayscale** -- not through image_transport's plugin, which on the
+real rig's `"yuv422; jpeg compressed mono8"` format decodes the mono8 payload
+but stamps the output yuv422, so cv_bridge rejects every frame. orbslam3_ros2
+reads the same blobs the same way (its record §12.3).
+
+Both stereo callbacks now share `submitStereo()`; a pair where either image
+fails to decode is dropped whole, since a half-decoded pair is worse than a
+missing one. `decode_failures_` counts them.
+
+`launch/wil_sim_vins_filter.launch.py` defaults to `image_transport:=compressed`
+and starts **no** republishers. `republish:=true` restores them for a raw-only
+source. The configured `image0_topic`/`image1_topic` stay suffix-free in the
+YAML; `/compressed` is appended by the node, so one config serves both
+transports.

@@ -14,8 +14,32 @@ imu_topic: "/imu0"                    # unused while imu:0; real yaw sensor topi
 #     -r in/compressed:=/cam0/image_raw/compressed -r out:=/cam0/image_raw
 #   ros2 run image_transport republish compressed raw --ros-args \
 #     -r in/compressed:=/cam1/image_raw/compressed -r out:=/cam1/image_raw
-image0_topic: "/cam0/image_raw"
-image1_topic: "/cam1/image_raw"
+# CAMERA ORDER -- image0 is the LEFT camera, and which bag topic that is changed
+# with the 2026-10-19 RealSense remount. VINS reads these topics ONLY from this
+# file (options->imageTopic()); there is no CLI override and no real-rig launch
+# file, so this is the single lever.
+#
+#   dataset_real_000   (2026-09-14): cam1 RIGHT of cam0 (+19 px) -> cam0 = image0
+#   dataset_realv2_*   (September)  : same era, assumed the same, NOT re-measured
+#                                     (those bags are no longer on disk)
+#   dataset_realv3_000 (2026-10-20): cam1 LEFT  of cam0 (-33 px) -> cam1 = image0
+#
+# body_T_cam1 puts cam1 at +X (right), so with the pre-remount order every correct
+# stereo match triangulates BEHIND the cameras. Measured on realv3: 1 % of matches
+# in front as-is vs 99 % swapped. In ORB-SLAM3 that produced "New Map created with
+# 0 points" and a reset every 3 frames while still extracting ~4000 features --
+# it looks like a feature-extraction failure and is not one.
+#
+# SWAPPED on 2026-10-20 for realv3. To replay a pre-remount bag, swap back.
+# 2026-10-21: swap RETIRED -- topics are cam0/cam1 again and body_T_cam1 now puts
+# cam1 at -X (left), which is where it is. Old bags need the OLD body_T_cam1.
+# Verify any new bag first:  python3 script/check_stereo_side.py <bag> 8
+# cam0_fisheye.yaml and cam1_fisheye.yaml are numerically identical (only
+# camera_name differs), so the calib assignment does not need swapping too.
+# image0_topic: "/cam1/image_raw"   # was "/cam0/image_raw" before the remount
+image0_topic: "/cam0/image_raw"   # 2026-10-21: cam0 = cam0, cam1 = cam1, extrinsics now carry the side
+# image1_topic: "/cam0/image_raw"   # was "/cam1/image_raw" before the remount
+image1_topic: "/cam1/image_raw"   # 2026-10-21: cam0 = cam0, cam1 = cam1, extrinsics now carry the side
 output_path: "~/output/wil_stereo/"
 
 cam0_calib: "cam0_fisheye.yaml"
@@ -33,8 +57,11 @@ use_gpu_ceres: 0
 # configs (cam x-right/y-down/z-forward -> body x-forward/y-left/z-up).
 # body_T_cam1 = body_T_cam0 * cam0_T_cam1, where cam0_T_cam1 is the inverse of the
 # calibrated (R, T) that maps cam0-frame points into cam1-frame points, i.e.
-# cam0_T_cam1.R = R^T, cam0_T_cam1.t = -R^T @ T. Baseline is ~9.36cm with a ~1.09deg
+# cam0_T_cam1.R = R^T, cam0_T_cam1.t = -R^T @ T. Baseline is ~8.97cm with a ~0.97deg
 # relative rotation between the two cameras (a real, slightly non-parallel rig).
+# (2026-10-21 recalibration, camera_parameters/211026camera1_rot_trans.dat; the
+#  2026-08-06 values were ~9.36cm / ~1.09deg with cam1 on +X -- see the commented
+#  body_T_cam1 block below.)
 # (Older ~3.15cm/33mm-baseline calibration archived in config/wil/baseline_33m/.)
 estimate_extrinsic: 0
 
@@ -47,14 +74,27 @@ body_T_cam0: !!opencv-matrix
            0.0, -1.0,  0.0,  0.0,
            0.0,  0.0,  0.0,  1.0]
 
+# UPDATED 2026-10-21: body_T_cam1 = body_T_cam0 * cam0_T_cam1, with cam0_T_cam1 the
+# INVERSE of camera_parameters/211026camera1_rot_trans.dat (OpenCV cam1_T_cam0).
+# Topics are cam0 = image0, cam1 = image1 (no swap); cam1 is physically LEFT of
+# cam0, hence x = -0.0897 m. Baseline 0.089723 m, 0.9669 deg.
+# OLD value, kept for reference (derived from the 2026-08-06 .dat, cam1 at +X):
+# body_T_cam1: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [-0.0112430044,  0.0137423283,  0.9998423592,  0.0003943868,
+#           -0.9999155119, -0.0066784035, -0.0111520357, -0.0935980368,
+#            0.0065240958, -0.9998832669,  0.0138162526,  0.0010121732,
+#            0.0,            0.0,           0.0,           1.0]
 body_T_cam1: !!opencv-matrix
-   rows: 4
-   cols: 4
-   dt: d
-   data: [-0.0112430044,  0.0137423283,  0.9998423592,  0.0003943868,
-          -0.9999155119, -0.0066784035, -0.0111520357, -0.0935980368,
-           0.0065240958, -0.9998832669,  0.0138162526,  0.0010121732,
-           0.0,            0.0,           0.0,           1.0]
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ 0.0160612906, -0.0008406756,  0.9998706557,  0.0010314226,
+         -0.9998579160,  0.0051040575,  0.0160653773,  0.0897173102,
+         -0.0051169031, -0.9999866208, -0.0007585784, -0.0000049715,
+          0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
 
 # Feature tracker
 multiple_thread: 1

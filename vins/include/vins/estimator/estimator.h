@@ -82,6 +82,12 @@ class Estimator {
   std::size_t dynamicDroppedPoints() const {
     return featureTracker.dynamic_dropped;
   }
+  /// Companion of dynamicDroppedPoints(): points the stock min-distance rule
+  /// culled in the same loop. Reading one without the other invites attributing
+  /// ordinary culling to the filter.
+  std::size_t minDistanceDroppedPoints() const {
+    return featureTracker.mindist_dropped;
+  }
   //
   void processMeasurements();
   //

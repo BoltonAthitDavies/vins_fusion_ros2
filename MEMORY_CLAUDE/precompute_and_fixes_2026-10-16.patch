@@ -1,0 +1,407 @@
+diff --git a/MEMORY_CLAUDE/README.md b/MEMORY_CLAUDE/README.md
+index 141aa82..2875828 100644
+--- a/MEMORY_CLAUDE/README.md
++++ b/MEMORY_CLAUDE/README.md
+@@ -375,3 +375,131 @@ them for a second. Only 16 truly-moving voted rows, so the recall figure is a
+ small-sample estimate. Levers if resumed: `motion_min_points 8` (coverage ×3
+ at 1.9 % false alarm), `max_cnt` in the VINS config (more features per frame),
+ and `realistic_002` for a larger moving sample.
++
++## 11. The motion census does not work, and why (2026-10-15) — NEGATIVE RESULT
++
++Everything in §10 is implemented and runs. On `dataset_dynamic_nofloortexture_00_000`
++it does not detect motion. Four diagnostics, in order, each ruling out the
++explanation the previous one suggested. **Read this before attempting a fifth.**
++
++Ground truth throughout is `script/motion_votes_eval.py`, which projects the
++props into cam0 and labels each voted box moving/static from `pose/info` speed.
++On this bag **64 % of box-frames sit on genuinely moving objects**, so the
++scene is not the problem.
++
++### 11.1 The headline
++
++| census | signal | result |
++|---|---|---|
++| solved depth (§10) | feature holds a solved, positive depth in the window | moving and static indistinguishable |
++| reprojection residual | median `ave_err × FOCAL_LENGTH` per box vs background | **inverted** — movers score LOWER |
++| residual availability | fraction of a box's features that have a residual at all | recall 0.56 at 41 % false alarm |
++
++### 11.2 Solved depth: measures depth observability, not motion
++
++At the shipped defaults, against truth:
++
++```
++truth / verdict   unknown   static   moving
++moving               1558      180      216     <- catches 11 % of truly-moving box-frames
++static                605       54       56
++voted rows:  moving n=84  median ratio 1.66     static n=26  median 1.93
++             recall 0.250   false alarm 0.231   (chance)
++```
++
++Starvation was suspected first — the median box held **3** tracked features of
++the 150 VINS keeps. Two config experiments settled it:
++
++- `max_cnt 150 → 250`: **no effect**. `feature_count` went 150 → 147; the scene
++  cannot supply more corners ≥30 px apart. Per-box distribution identical
++  (median 3, p75 6, p90 16), `processing_ms` 55.7 → 57.2. The ceiling is
++  `min_dist`, not `max_cnt`.
++- `min_dist 30 → 15` (with `max_cnt 250`): features per box 3 → **12**, coverage
++  19.6 % → 55.8 %. And the signal *vanished*: **94.7 %** of features inside
++  moving objects held solved depths, box/background ratio min **0.96**, median
++  2.03, and **zero** of 83 voted rows fell below the threshold.
++
++More data made it worse, which is the signature of a quantity that was never
++measuring the right thing. A moving point triangulates perfectly well — it
++converges to the WRONG depth, and `isSolved()` cannot tell the difference.
++
++### 11.3 Reprojection residual: confounded by survivorship
++
++`outliersRejection()` already computes each feature's average reprojection
++residual against the optimised window, uses it as a >3 px cutoff, and discards
++it. Capturing it before the purge looked like the obvious fix. Measured:
++
++```
++box/bg residual   moving n=31  median 0.57      static n=37  median 1.22
++sweep (moving if ABOVE):  1.5 -> recall 0.226 / false 0.270
++background median residual 1.915 px;  n_resid median 1
++```
++
++Movers score **lower**. `outliersRejection` purges >3 px features every frame,
++so a mover's bad features are gone within a frame or two and only the ones that
++happened to fit remain to be measured. Inverting the rule does not rescue it:
++31 moving samples, and the mechanism is a selection artifact, not a property of
++motion. The same effect caps coverage — a residual needs `used_num >= 4` and a
++mover's features rarely survive that long.
++
++### 11.4 Residual availability: also no
++
++If movers lose features before they reach four observations, the *fraction* of a
++box's features that have a residual should itself be the signal. It is not:
++`n_resid/n_kp` medians 0.14 (moving) vs 0.27 (static), sweep gives recall 0.56
++at **41 %** false alarm.
++
++### 11.5 The common cause
++
++All three read the BACKEND: the sliding window after optimisation and outlier
++rejection. VINS is *designed* to be robust to moving points — it purges anything
++over 3 px every frame and `featureManager` keeps only survivors. **By the time
++the window has an opinion about a feature, the features that disagreed with it
++are gone.** Asking the filter that removes movers to report where the movers are
++cannot work, whichever statistic is used.
++
++### 11.6 A trap in comparing runs
++
++The residual run's solved-depth block scored recall 0.738 (0.930 at
++`min_points 15`) against 0.250 for the earlier run at the *same* `max_cnt` and
++`min_dist`. **That is not an improvement.** The two runs used different decision
++rules, so they masked different boxes, so the surviving feature population
++differed, so the census differed. A census computed downstream of its own
++masking is not comparable across policies. Two earlier figures were quoted in
++this record before ground truth saw them and did not survive more data
++(`realistic_003` "recall 0.62 / 0.8 %" rested on 16 samples); do not quote a
++threshold or a rate until `motion_votes_eval.py` has scored it.
++
++### 11.7 If it is resumed: use the frontend
++
++The signal must be computed BEFORE rejection. Three things already exist and are
++unused:
++
++- **`FeatureTracker::rejectWithF()`** — written, and commented out at
++  `vins/src/featureTracker/feature_tracker.cpp:297`. RANSAC fundamental matrix
++  between consecutive frames; the outliers it marks are points violating
++  epipolar geometry, i.e. points that moved. Pre-rejection, every tracked point,
++  every frame. Cheapest honest attempt remaining.
++- **`Estimator::predictPtsInNextFrame()` / `FeatureTracker::setPrediction()`** —
++  implemented at `vins/src/estimator/estimator.cpp:1807`, never called.
++  Predicted-vs-tracked displacement per feature. Must be computed WITHOUT
++  calling `setPrediction`, which changes KLT initialisation
++  (`OPTFLOW_USE_INITIAL_FLOW`, one pyramid level) and would contaminate the
++  baseline.
++- **`ptsVelocity()`** — per-point image velocity, computed every frame and
++  already carried in the feature message as `vx, vy`. Ego-motion is a smooth
++  field; a mover is a coherent local anomaly in it. No new computation.
++
++ORB-SLAM3's gate is also weak (record §13: recall 0.43 at 5 % false alarm), so
++this is not a VINS-specific verdict on motion gating as an idea.
++
++### 11.8 Status
++
++The §10 implementation is reverted to the solved-depth census and remains in the
++tree, off by default (`filter_mode: class`). Experiment 3 runs on `class` mode,
++which is the RY-SLAM method the thesis tests; motion gating belongs in Chapter 5
++as attempted-and-failed, with the measurements above as its evidence.
++
++Kept from the same day and NOT part of this rewrite: `dets_csv` auto-discovery,
++`filter_status`, the detector watchdog, and the
++`dynamic_points_dropped`/`mindistance_points_dropped` split.
+diff --git a/include/vins_fusion_ros2/vins_estimator.h b/include/vins_fusion_ros2/vins_estimator.h
+index d8055c7..9681468 100755
+--- a/include/vins_fusion_ros2/vins_estimator.h
++++ b/include/vins_fusion_ros2/vins_estimator.h
+@@ -84,6 +84,8 @@ class VinsEstimator : public rclcpp::Node {
+   rclcpp::CallbackGroup::SharedPtr feature_callback_group_;
+   rclcpp::TimerBase::SharedPtr publish_timer_;
+   rclcpp::TimerBase::SharedPtr filter_report_timer_;
++  /// One-shot: errors if nothing publishes the detection topic (live mode).
++  rclcpp::TimerBase::SharedPtr dets_watchdog_;
+   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+   //
+   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image_track;
+diff --git a/src/vins_estimator.cpp b/src/vins_estimator.cpp
+index 9198282..55a19a1 100755
+--- a/src/vins_estimator.cpp
++++ b/src/vins_estimator.cpp
+@@ -4,7 +4,9 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
++#include <filesystem>
+ #include <fstream>
++#include <vector>
+ #include <sstream>
+ #include <opencv2/imgproc.hpp>
+ #include <rcpputils/filesystem_helper.hpp>
+@@ -29,13 +31,78 @@ VinsEstimator::VinsEstimator() : rclcpp::Node("vins_estimator") {
+   initialize();
+ }
+ 
++
++/// Looks for a precomputed detection file beside the bag.
++///
++/// WHY THIS EXISTS. The detector is a separate ROS node that lives in
++/// orbslam3_ros2. Its launch file spawns one automatically; this node has no
++/// launch file, so for VINS the detector became something a human had to
++/// remember to start in another terminal. On 2026-09-16 it was forgotten for
++/// four Experiment 3 runs and again three times on 2026-10-15: the node
++/// subscribed, nothing ever published, and every frame recorded matched=0 --
++/// runs that look complete and filtered nothing. Asking the operator to also
++/// know about `dets_csv` was a second thing to remember, not a fix.
++///
++/// So: with filter:=true and no explicit dets_csv, look next to the dataset.
++/// One candidate is used. Several is ambiguous -- they are different detector
++/// weights and silently picking one would put the wrong provenance in the
++/// manifest -- so that is an error naming them, not a guess.
++static std::string autoDetsCsv(
++  const std::string & dataset_path, std::string & note)
++{
++  namespace fs = std::filesystem;
++  std::error_code ec;
++  if (dataset_path.empty() || !fs::is_directory(dataset_path, ec)) {
++    note = "dataset_path is not a directory";
++    return {};
++  }
++  std::vector<std::string> found;
++  for (const auto & e : fs::directory_iterator(dataset_path, ec)) {
++    const auto name = e.path().filename().string();
++    if (name.rfind("dets", 0) == 0 && e.path().extension() == ".csv") {
++      found.push_back(e.path().string());
++    }
++  }
++  std::sort(found.begin(), found.end());
++  if (found.empty()) {
++    note = "no dets*.csv beside the bag; run script/yolo_precompute.py";
++    return {};
++  }
++  if (found.size() > 1) {
++    // Ambiguous only in principle: the chosen path is written to
++    // run_metadata.csv and the file's own `#` header names the weight and
++    // thresholds, so provenance survives the choice. Refusing to choose would
++    // just push the operator back to the failure this function exists to
++    // prevent. Prefer an unsuffixed dets.csv, then the project's primary
++    // weight, then alphabetical -- and say out loud what was picked.
++    auto prefer = [&found](const std::string & want) {
++      for (const auto & f : found) {
++        if (std::filesystem::path(f).filename() == want) return f;
++      }
++      return std::string{};
++    };
++    std::string pick = prefer("dets.csv");
++    if (pick.empty()) pick = prefer("dets_best.csv");
++    if (pick.empty()) pick = found.front();
++    note = "chose " + fs::path(pick).filename().string() + " of";
++    for (const auto & f : found) {
++      note += " " + fs::path(f).filename().string();
++    }
++    note += " -- pass dets_csv to override";
++    return pick;
++  }
++  note = "auto-discovered beside the bag";
++  return found.front();
++}
++
+ void VinsEstimator::reportFilter() {
+   RCLCPP_INFO(this->get_logger(),
+               "dynamic filter: %zu frames masked, %zu with no recent detection, "
+-              "%zu tracked points dropped onto dynamic regions, %zu masks "
+-              "discarded for exceeding max_mask_fraction",
++              "%zu tracked points dropped onto dynamic regions (%zu to the stock "
++              "min-distance rule), %zu masks discarded for exceeding "
++              "max_mask_fraction",
+               det_matched_, det_missed_, estimator_->dynamicDroppedPoints(),
+-              mask_rejected_);
++              estimator_->minDistanceDroppedPoints(), mask_rejected_);
+   if (det_matched_ == 0) {
+     RCLCPP_WARN(this->get_logger(),
+                 "filter is ON but NOT ONE frame has matched a detection. Is the "
+@@ -69,11 +136,19 @@ VinsEstimator::~VinsEstimator() {
+                   : 0.0) << '\n'
+           << "detection_source,"
+           << (!filter_ ? "none" : dets_csv_.empty() ? "live" : "file") << '\n'
++          // One word a later reader cannot misread. `never_fired` is the
++          // 2026-09-16 failure: filter on, detector absent, nothing masked.
++          << "filter_status,"
++          << (!filter_ ? "none"
++              : det_matched_ == 0 ? "never_fired"
++              : det_matched_ < (det_matched_ + det_missed_) * 98 / 100 ? "degraded"
++              : "ok") << '\n'
+           << "filter_mode," << (filter_ ? filter_mode_ : "none") << '\n'
+           << "boxes_voted_moving," << boxes_voted_moving_ << '\n'
+           << "boxes_voted_static," << boxes_voted_static_ << '\n'
+           << "masks_rejected," << mask_rejected_ << '\n'
+-          << "dynamic_points_dropped," << estimator_->dynamicDroppedPoints() << '\n';
++          << "dynamic_points_dropped," << estimator_->dynamicDroppedPoints() << '\n'
++          << "mindistance_points_dropped," << estimator_->minDistanceDroppedPoints() << '\n';
+     }
+   }
+   if (filter_) {
+@@ -184,6 +259,23 @@ void VinsEstimator::initializeParamters() {
+ 
+   const auto experiment_id = readParam<std::string>(this, "experiment_id", "");
+   const auto dataset_path = readParam<std::string>(this, "dataset_path", "");
++  // Resolve the detection source now that dataset_path is known. Explicit
++  // dets_csv always wins; otherwise look beside the bag. Falling through to the
++  // live topic is the last resort and says so.
++  if (filter_ && dets_csv_.empty()) {
++    std::string note;
++    const auto found = autoDetsCsv(dataset_path, note);
++    if (!found.empty()) {
++      dets_csv_ = found;
++      RCLCPP_INFO(this->get_logger(), "dets_csv: %s (%s)", found.c_str(), note.c_str());
++    } else {
++      RCLCPP_WARN(this->get_logger(),
++                  "filter is ON with no dets_csv -- %s. Falling back to the live "
++                  "topic, which needs dynamic_detector_node.py running in another "
++                  "terminal; if it is not, every frame will record matched=0.",
++                  note.c_str());
++    }
++  }
+   const auto world_path = readParam<std::string>(this, "world_path", "");
+   const auto replay_rate = readParam<double>(this, "replay_rate", 1.0);
+   const auto run_command = readParam<std::string>(this, "run_command", "");
+@@ -344,6 +436,31 @@ void VinsEstimator::initializeSubscribers() {
+                   dets_csv_.c_str(), mask_dilate_px_, det_max_age_ * 1e3,
+                   max_mask_fraction_ * 100.0);
+     } else {
++      // NOBODY STARTS THE DETECTOR FOR US. orbslam3_ros2 has a launch file that
++      // spawns dynamic_detector_node.py alongside the tracker; this package has
++      // none by design (it is a submodule and must not depend on a workspace
++      // sibling), so the detector is a separate terminal the operator has to
++      // remember. On 2026-09-16 it was not started for four Experiment 3 runs:
++      // the subscription was created, nothing ever published, and all 2563
++      // frames recorded matched=0 -- a run that looks complete and filtered
++      // nothing. The 10 s report said so, but only to a terminal nobody kept.
++      // Say it once, loudly, after the detector has had time to load torch.
++      dets_watchdog_ = this->create_wall_timer(
++          std::chrono::seconds(20), [this, dets_topic]() {
++            dets_watchdog_->cancel();
++            if (this->count_publishers(dets_topic) > 0) return;
++            RCLCPP_ERROR(
++                this->get_logger(),
++                "filter is ON but NOTHING publishes %s after 20 s. This package "
++                "has no launch file, so the detector is a SEPARATE process:\n"
++                "    ros2 run orbslam3_ros2 dynamic_detector_node.py --ros-args "
++                "-p weights_path:=<.pt> -p image_topic:=/cam0/image_raw\n"
++                "Every frame will record matched=0 and the run will NOT be "
++                "comparable with its baseline. Better still, precompute with "
++                "script/yolo_precompute.py and pass dets_csv -- then no detector "
++                "process is needed at all.",
++                dets_topic.c_str());
++          });
+       rclcpp::SubscriptionOptions sub_opt_dets;
+       sub_opt_dets.callback_group = dets_callback_group_;
+       dets_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
+diff --git a/vins/include/vins/estimator/estimator.h b/vins/include/vins/estimator/estimator.h
+index 7be45a8..9c7db53 100755
+--- a/vins/include/vins/estimator/estimator.h
++++ b/vins/include/vins/estimator/estimator.h
+@@ -82,6 +82,12 @@ class Estimator {
+   std::size_t dynamicDroppedPoints() const {
+     return featureTracker.dynamic_dropped;
+   }
++  /// Companion of dynamicDroppedPoints(): points the stock min-distance rule
++  /// culled in the same loop. Reading one without the other invites attributing
++  /// ordinary culling to the filter.
++  std::size_t minDistanceDroppedPoints() const {
++    return featureTracker.mindist_dropped;
++  }
+   //
+   void processMeasurements();
+   //
+diff --git a/vins/include/vins/featureTracker/feature_tracker.h b/vins/include/vins/featureTracker/feature_tracker.h
+index 537ee38..44bbb8c 100755
+--- a/vins/include/vins/featureTracker/feature_tracker.h
++++ b/vins/include/vins/featureTracker/feature_tracker.h
+@@ -81,6 +81,10 @@ class FeatureTracker {
+   /// Tracked points dropped so far because they drifted onto a dynamic region.
+   /// Diagnostic only; the node logs it so a run that filtered nothing is visible.
+   size_t dynamic_dropped = 0;
++  /// Points culled by the stock min-distance rule in the same loop. Stock
++  /// behaviour, filter or not; kept so dynamic_dropped can be read against it
++  /// rather than against nothing.
++  size_t mindist_dropped = 0;
+   cv::Mat fisheye_mask;
+   cv::Mat prev_img, cur_img;
+   vector<cv::Point2f> n_pts;
+diff --git a/vins/src/featureTracker/feature_tracker.cpp b/vins/src/featureTracker/feature_tracker.cpp
+index a2ba194..b0b0097 100755
+--- a/vins/src/featureTracker/feature_tracker.cpp
++++ b/vins/src/featureTracker/feature_tracker.cpp
+@@ -81,8 +81,6 @@ void FeatureTracker::setMask() {
+               << " type " << dynamic_mask.type();
+     mask = cv::Mat(row, col, CV_8UC1, cv::Scalar(255));
+   }
+-  const size_t n_before = cur_pts.size();
+-
+   // prefer to keep features that are tracked for long time
+   vector<pair<int, pair<cv::Point2f, int>>> cnt_pts_id;
+ 
+@@ -100,20 +98,30 @@ void FeatureTracker::setMask() {
+   ids.clear();
+   track_cnt.clear();
+ 
++  // `mask` carries TWO kinds of zero by the end of this loop: the dynamic
++  // regions it was seeded with, and the min-distance circles painted as points
++  // are kept. A rejected point must be attributed to the right one.
++  //
++  // The previous version counted every rejection on a masked frame as a dynamic
++  // drop, because it only differenced the vector size. Min-distance culling is
++  // stock behaviour that happens with or without a filter, so that figure was an
++  // upper bound, not a measurement -- and it was the figure the engineering
++  // record quoted as proof the KLT-persistence problem was handled. Test the
++  // ORIGINAL dynamic mask instead; it is exact and costs one lookup per
++  // rejected point.
+   for (auto &it : cnt_pts_id) {
+-    if (mask.at<uchar>(it.second.first) == 255) {
+-      cur_pts.push_back(it.second.first);
++    const cv::Point2f &pt = it.second.first;
++    if (mask.at<uchar>(pt) == 255) {
++      cur_pts.push_back(pt);
+       ids.push_back(it.second.second);
+       track_cnt.push_back(it.first);
+-      cv::circle(mask, it.second.first, options->min_feature_distance, 0, -1);
++      cv::circle(mask, pt, options->min_feature_distance, 0, -1);
++    } else if (!dynamic_mask.empty() && dynamic_mask.at<uchar>(pt) != 255) {
++      ++dynamic_dropped;
++    } else {
++      ++mindist_dropped;
+     }
+   }
+-  // Only the points lost to the DYNAMIC regions are interesting; the ones lost to
+-  // min-distance circles are normal operation. Recomputing the split exactly would
+-  // mean a second pass, so attribute the drop only when a dynamic mask was in play.
+-  if (!dynamic_mask.empty() && cur_pts.size() < n_before) {
+-    dynamic_dropped += n_before - cur_pts.size();
+-  }
+ }
+ 
+ void FeatureTracker::addPoints() {

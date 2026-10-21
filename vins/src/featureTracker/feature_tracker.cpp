@@ -81,8 +81,6 @@ void FeatureTracker::setMask() {
               << " type " << dynamic_mask.type();
     mask = cv::Mat(row, col, CV_8UC1, cv::Scalar(255));
   }
-  const size_t n_before = cur_pts.size();
-
   // prefer to keep features that are tracked for long time
   vector<pair<int, pair<cv::Point2f, int>>> cnt_pts_id;
 
@@ -100,19 +98,29 @@ void FeatureTracker::setMask() {
   ids.clear();
   track_cnt.clear();
 
+  // `mask` carries TWO kinds of zero by the end of this loop: the dynamic
+  // regions it was seeded with, and the min-distance circles painted as points
+  // are kept. A rejected point must be attributed to the right one.
+  //
+  // The previous version counted every rejection on a masked frame as a dynamic
+  // drop, because it only differenced the vector size. Min-distance culling is
+  // stock behaviour that happens with or without a filter, so that figure was an
+  // upper bound, not a measurement -- and it was the figure the engineering
+  // record quoted as proof the KLT-persistence problem was handled. Test the
+  // ORIGINAL dynamic mask instead; it is exact and costs one lookup per
+  // rejected point.
   for (auto &it : cnt_pts_id) {
-    if (mask.at<uchar>(it.second.first) == 255) {
-      cur_pts.push_back(it.second.first);
+    const cv::Point2f &pt = it.second.first;
+    if (mask.at<uchar>(pt) == 255) {
+      cur_pts.push_back(pt);
       ids.push_back(it.second.second);
       track_cnt.push_back(it.first);
-      cv::circle(mask, it.second.first, options->min_feature_distance, 0, -1);
+      cv::circle(mask, pt, options->min_feature_distance, 0, -1);
+    } else if (!dynamic_mask.empty() && dynamic_mask.at<uchar>(pt) != 255) {
+      ++dynamic_dropped;
+    } else {
+      ++mindist_dropped;
     }
-  }
-  // Only the points lost to the DYNAMIC regions are interesting; the ones lost to
-  // min-distance circles are normal operation. Recomputing the split exactly would
-  // mean a second pass, so attribute the drop only when a dynamic mask was in play.
-  if (!dynamic_mask.empty() && cur_pts.size() < n_before) {
-    dynamic_dropped += n_before - cur_pts.size();
   }
 }
 

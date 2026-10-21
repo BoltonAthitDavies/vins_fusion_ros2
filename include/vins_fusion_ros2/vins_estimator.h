@@ -8,6 +8,7 @@
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
@@ -21,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+using sensor_msgs::msg::CompressedImage;
 using sensor_msgs::msg::Image;
 using namespace message_filters;
 
@@ -28,6 +30,17 @@ class VinsEstimator : public rclcpp::Node {
  public:
   using SyncPolicy =
       message_filters::sync_policies::ApproximateTime<Image, Image>;
+  /// The sim and real bags carry ONLY /camN/image_raw/compressed. Decoding the
+  /// JPEG here, as orbslam3_ros2 already does, removes the pair of
+  /// `image_transport republish` processes that were otherwise required -- and
+  /// with them a class of faults that cost real runs: raw 1280x720 rgb8 is
+  /// 2.7 MB per message over best-effort DDS and is dropped nondeterministically
+  /// (919 vs 813 frames in two identical runs), two republisher pairs on one
+  /// topic deliver every frame twice, and a pair left over from an earlier
+  /// session silently feeds later runs.
+  using CompressedSyncPolicy =
+      message_filters::sync_policies::ApproximateTime<CompressedImage,
+                                                      CompressedImage>;
 
   VinsEstimator();
   ~VinsEstimator();
@@ -41,6 +54,15 @@ class VinsEstimator : public rclcpp::Node {
   void timeCallback();
   void stereoCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img0,
                       const sensor_msgs::msg::Image::ConstSharedPtr& img1);
+  void stereoCompressedCallback(
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr& img0,
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr& img1);
+  /// Shared tail of both stereo callbacks: mask, log, hand to the estimator.
+  void submitStereo(const cv::Mat& im0, const cv::Mat& im1, double t,
+                    const builtin_interfaces::msg::Time& stamp);
+  /// JPEG -> grayscale. Returns an empty Mat and warns on a decode failure.
+  cv::Mat decodeCompressed(
+      const sensor_msgs::msg::CompressedImage& msg, const char* which);
 
   /// Buffers YOLO detections by their SOURCE IMAGE stamp. Deliberately NOT part
   /// of the stereo message_filters sync: a 3-way ApproximateTime would drop
@@ -50,10 +72,7 @@ class VinsEstimator : public rclcpp::Node {
       const vision_msgs::msg::Detection2DArray::ConstSharedPtr& msg);
   /// CV_8UC1 mask for a frame: 255 = keep, 0 = dynamic. Empty when filtering is
   /// off, no detection is recent enough, or the mask would blank too much.
-  cv::Mat maskFor(const builtin_interfaces::msg::Time& stamp, double t,
-                  const cv::Size& size);
-  /// Loads a script/yolo_precompute.py file into dets_file_ (see dets_csv).
-  void loadDetsCsv(const std::string& path);
+  cv::Mat maskFor(double t, const cv::Size& size);
   static int64_t stampNs(const builtin_interfaces::msg::Time& t);
   /// Motion gate: drain finished censuses from the estimator into verdicts.
   void applyPendingVotes();
@@ -79,11 +98,20 @@ class VinsEstimator : public rclcpp::Node {
   std::shared_ptr<Subscriber<Image>> sub_img0_filter_;
   std::shared_ptr<Subscriber<Image>> sub_img1_filter_;
   std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_img_;
+  std::shared_ptr<Subscriber<CompressedImage>> sub_cimg0_filter_;
+  std::shared_ptr<Subscriber<CompressedImage>> sub_cimg1_filter_;
+  std::shared_ptr<message_filters::Synchronizer<CompressedSyncPolicy>> sync_cimg_;
+  /// "raw" (default) or "compressed"; appends /compressed to the configured
+  /// topics when compressed.
+  std::string image_transport_{"raw"};
+  std::size_t decode_failures_ = 0;
   rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
   rclcpp::CallbackGroup::SharedPtr image_callback_group_;
   rclcpp::CallbackGroup::SharedPtr feature_callback_group_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
   rclcpp::TimerBase::SharedPtr filter_report_timer_;
+  /// One-shot: errors if nothing publishes the detection topic (live mode).
+  rclcpp::TimerBase::SharedPtr dets_watchdog_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   //
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image_track;
@@ -97,9 +125,6 @@ class VinsEstimator : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr dets_callback_group_;
   std::mutex dets_mu_;
   std::deque<std::pair<double, std::vector<cv::Rect2f>>> dets_;
-  /// Precomputed detections keyed by image header stamp (ns); empty = live mode.
-  std::string dets_csv_;
-  std::map<int64_t, std::vector<cv::Rect2f>> dets_file_;
   bool filter_ = false;
   int mask_dilate_px_ = 8;
   double det_max_age_ = 0.15;

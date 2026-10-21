@@ -36,8 +36,30 @@ imu_topic: "/hwt101ct_yaw_publisher"
 #     -r in/compressed:=/cam0/image_raw/compressed -r out:=/cam0/image_raw
 #   ros2 run image_transport republish compressed raw --ros-args \
 #     -r in/compressed:=/cam1/image_raw/compressed -r out:=/cam1/image_raw
-image0_topic: "/cam0/image_raw"
-image1_topic: "/cam1/image_raw"
+# CAMERA ORDER -- image0 is the LEFT camera, and which bag topic that is changed
+# with the 2026-10-19 RealSense remount. VINS reads these topics ONLY from this
+# file (options->imageTopic()); there is no CLI override and no real-rig launch
+# file, so this is the single lever.
+#
+#   dataset_real_000   (2026-09-14): cam1 RIGHT of cam0 (+19 px) -> cam0 = image0
+#   dataset_realv2_*   (September)  : same era, assumed the same, NOT re-measured
+#                                     (those bags are no longer on disk)
+#   dataset_realv3_000 (2026-10-20): cam1 LEFT  of cam0 (-33 px) -> cam1 = image0
+#
+# body_T_cam1 puts cam1 at +X (right), so with the pre-remount order every correct
+# stereo match triangulates BEHIND the cameras. Measured on realv3: 1 % of matches
+# in front as-is vs 99 % swapped. In ORB-SLAM3 that produced "New Map created with
+# 0 points" and a reset every 3 frames while still extracting ~4000 features --
+# it looks like a feature-extraction failure and is not one.
+#
+# SWAPPED on 2026-10-20 for realv3. To replay a pre-remount bag, swap back.
+# 2026-10-21: swap RETIRED -- topics are cam0/cam1 again and body_T_cam1 now puts
+# cam1 at -X (left), which is where it is. Old bags need the OLD body_T_cam1.
+# Verify any new bag first:  python3 script/check_stereo_side.py <bag> 8
+# cam0_fisheye.yaml and cam1_fisheye.yaml are numerically identical (only
+# camera_name differs), so the calib assignment does not need swapping too.
+image0_topic: "/cam0/image_raw"   # was "/cam0/image_raw" before the remount
+image1_topic: "/cam1/image_raw"   # was "/cam1/image_raw" before the remount
 
 output_path: "/home/ambushee/output/wil_stereo_imu/"   # absolute: "~" is NOT expanded by ofstream
 
@@ -62,7 +84,15 @@ use_gpu_ceres: 0
 # of (+0.029, -0.997, -0.075): gravity lies almost entirely on -Y, so the IMU's +Y axis
 # points DOWN. That is the RealSense convention, x-right / y-down / z-forward, which is
 # the SAME convention as a camera optical frame. So the IMU -> cam0 rotation is
-# approximately IDENTITY, and body_T_cam0 below is set accordingly.
+# approximately IDENTITY.
+#
+# UPDATE 2026-10-19: the RealSense is now mounted rotated 180 deg about its own X
+# axis, so that identity becomes diag(1, -1, -1) -- X unchanged, Y and Z negated.
+# body_T_cam0 below is set accordingly, and body_T_cam1 is left-multiplied by the
+# same rotation (negate rows 2 and 3), which preserves the 0.0936 m baseline and
+# keeps det(R) = +1. Stationary accelerometer should now read
+# (+0.269, +9.236, +0.695) m/s^2 raw instead of (+0.269, -9.236, -0.695); check
+# that first if a run misbehaves.
 #
 # Note this is a real correction, not a cosmetic one: stereo.yaml's matrix rotates
 # camera-optical into an x-forward/y-left/z-up body frame, which was right when cam0 WAS
@@ -98,18 +128,31 @@ body_T_cam0: !!opencv-matrix
    cols: 4
    dt: d
    data: [ 1.0,  0.0,  0.0,  0.0,
-           0.0,  1.0,  0.0,  0.0,
-           0.0,  0.0,  1.0,  0.0,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0, -1.0,  0.0,
            0.0,  0.0,  0.0,  1.0]
 
+# UPDATED 2026-10-21: body_T_cam1 = body_T_cam0 * cam0_T_cam1, with cam0_T_cam1 the
+# INVERSE of camera_parameters/211026camera1_rot_trans.dat (OpenCV cam1_T_cam0).
+# Topics are cam0 = image0, cam1 = image1 (no swap); cam1 is physically LEFT of
+# cam0, hence x = -0.0897 m. Baseline 0.089723 m, 0.9669 deg.
+# OLD value, kept for reference (derived from the 2026-08-06 .dat, cam1 at +X):
+# body_T_cam1: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 0.9999155119,  0.0066784035,  0.0111520357,  0.0935980368,
+#            0.0065240958, -0.9998832669,  0.0138162526,  0.0010121732,
+#            0.0112430044, -0.0137423283, -0.9998423592, -0.0003943868,
+#            0.0,           0.0,           0.0,           1.0]
 body_T_cam1: !!opencv-matrix
-   rows: 4
-   cols: 4
-   dt: d
-   data: [ 0.9999155119,  0.0066784035,  0.0111520357,  0.0935980368,
-          -0.0065240958,  0.9998832669, -0.0138162526, -0.0010121732,
-          -0.0112430044,  0.0137423283,  0.9998423592,  0.0003943868,
-           0.0,           0.0,           0.0,           1.0]
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ 0.9998579160, -0.0051040575, -0.0160653773, -0.0897173102,
+         -0.0051169031, -0.9999866208, -0.0007585784, -0.0000049715,
+         -0.0160612906,  0.0008406756, -0.9998706557, -0.0010314226,
+          0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
 
 # Feature tracker
 multiple_thread: 1

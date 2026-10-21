@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <vector>
 #include <sstream>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <rcpputils/filesystem_helper.hpp>
 #include <stdexcept>
@@ -29,13 +32,16 @@ VinsEstimator::VinsEstimator() : rclcpp::Node("vins_estimator") {
   initialize();
 }
 
+
+
 void VinsEstimator::reportFilter() {
   RCLCPP_INFO(this->get_logger(),
               "dynamic filter: %zu frames masked, %zu with no recent detection, "
-              "%zu tracked points dropped onto dynamic regions, %zu masks "
-              "discarded for exceeding max_mask_fraction",
+              "%zu tracked points dropped onto dynamic regions (%zu to the stock "
+              "min-distance rule), %zu masks discarded for exceeding "
+              "max_mask_fraction",
               det_matched_, det_missed_, estimator_->dynamicDroppedPoints(),
-              mask_rejected_);
+              estimator_->minDistanceDroppedPoints(), mask_rejected_);
   if (det_matched_ == 0) {
     RCLCPP_WARN(this->get_logger(),
                 "filter is ON but NOT ONE frame has matched a detection. Is the "
@@ -48,8 +54,7 @@ void VinsEstimator::reportFilter() {
     RCLCPP_WARN(this->get_logger(),
                 "only %.1f%% of frames (%zu of %zu) had a detection to mask "
                 "with; the filter is effectively OFF for the rest and this run "
-                "is NOT comparable with filter:=false. Precompute with "
-                "script/yolo_precompute.py and pass dets_csv.",
+                "is NOT comparable with filter:=false.",
                 100.0 * det_matched_ / (det_matched_ + det_missed_),
                 det_matched_, det_matched_ + det_missed_);
   }
@@ -67,13 +72,19 @@ VinsEstimator::~VinsEstimator() {
           << (det_matched_ + det_missed_
                   ? static_cast<double>(det_matched_) / (det_matched_ + det_missed_)
                   : 0.0) << '\n'
-          << "detection_source,"
-          << (!filter_ ? "none" : dets_csv_.empty() ? "live" : "file") << '\n'
+          // One word a later reader cannot misread. `never_fired` is the
+          // 2026-09-16 failure: filter on, detector absent, nothing masked.
+          << "filter_status,"
+          << (!filter_ ? "none"
+              : det_matched_ == 0 ? "never_fired"
+              : det_matched_ < (det_matched_ + det_missed_) * 98 / 100 ? "degraded"
+              : "ok") << '\n'
           << "filter_mode," << (filter_ ? filter_mode_ : "none") << '\n'
           << "boxes_voted_moving," << boxes_voted_moving_ << '\n'
           << "boxes_voted_static," << boxes_voted_static_ << '\n'
           << "masks_rejected," << mask_rejected_ << '\n'
-          << "dynamic_points_dropped," << estimator_->dynamicDroppedPoints() << '\n';
+          << "dynamic_points_dropped," << estimator_->dynamicDroppedPoints() << '\n'
+          << "mindistance_points_dropped," << estimator_->minDistanceDroppedPoints() << '\n';
     }
   }
   if (filter_) {
@@ -148,14 +159,15 @@ void VinsEstimator::initializeParamters() {
   // ImageData::mask stays empty, so FeatureTracker::setMask() takes its original
   // all-255 path -- the stock tracker, bit for bit, and the recorded baseline
   // stays reproducible.
+  // "raw" or "compressed". The bags carry only /camN/image_raw/compressed, so
+  // compressed removes the two `image_transport republish` helper processes
+  // entirely -- see VinsEstimator::CompressedSyncPolicy for why that matters.
+  // The configured topics stay suffix-free; /compressed is appended here.
+  image_transport_ = readParam<std::string>(this, "image_transport", "raw");
+  if (image_transport_ != "raw" && image_transport_ != "compressed") {
+    throw std::runtime_error("image_transport must be 'raw' or 'compressed'");
+  }
   filter_ = readParam<bool>(this, "filter", false);
-  // Precomputed detections (script/yolo_precompute.py). When set, no detector
-  // subscription is created: each frame's boxes are looked up by its OWN header
-  // stamp, so two runs of one bag mask identical frames with identical boxes.
-  // The live path depends on the detector staying within det_max_age of the
-  // tracker, which on this laptop varied from 33% to 91% of frames with the
-  // machine's temperature.
-  dets_csv_ = readParam<std::string>(this, "dets_csv", "");
   // "class": every detected box is masked. "motion": a box is masked only once
   // the estimator has seen it move -- scored after the backend processes the
   // frame (features inside the box holding a solved depth, against the
@@ -202,6 +214,7 @@ void VinsEstimator::initializeParamters() {
         {"dataset_path", dataset_path}, {"world_path", world_path},
         {"run_command", run_command}, {"run_notes", run_notes},
         {"config_file", config_file}, {"output_path", output_path_},
+        {"image_transport", image_transport_},
         {"image0_topic", options->imageTopic()},
         {"image1_topic", options->image1Topic()}, {"imu_topic", options->imuTopic()},
         {"world_frame_id", world_frame_id}, {"body_frame_id", body_frame_id},
@@ -216,7 +229,6 @@ void VinsEstimator::initializeParamters() {
         {"det_max_age_s", std::to_string(det_max_age_)},
         {"mask_dilate_px", std::to_string(mask_dilate_px_)},
         {"max_mask_fraction", std::to_string(max_mask_fraction_)},
-        {"dets_csv", dets_csv_},
         {"filter_mode", filter_mode_},
         {"motion_iou", std::to_string(motion_iou_)},
         {"motion_min_points", std::to_string(motion_min_points_)},
@@ -301,18 +313,35 @@ void VinsEstimator::initializeSubscribers() {
     image_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
     image_qos.depth = 100;
 
-    sub_img0_filter_ = std::make_shared<Subscriber<Image>>(
-        this, options->imageTopic(), image_qos, sub_opt_image);
+    if (image_transport_ == "compressed") {
+      sub_cimg0_filter_ = std::make_shared<Subscriber<CompressedImage>>(
+          this, options->imageTopic() + "/compressed", image_qos, sub_opt_image);
+      sub_cimg1_filter_ = std::make_shared<Subscriber<CompressedImage>>(
+          this, options->image1Topic() + "/compressed", image_qos, sub_opt_image);
+      sync_cimg_ =
+          std::make_shared<message_filters::Synchronizer<CompressedSyncPolicy>>(
+              CompressedSyncPolicy(100), *sub_cimg0_filter_, *sub_cimg1_filter_);
+      sync_cimg_->registerCallback(
+          std::bind(&VinsEstimator::stereoCompressedCallback, this,
+                    std::placeholders::_1, std::placeholders::_2));
+      RCLCPP_INFO(this->get_logger(),
+                  "images: %s/compressed + %s/compressed (decoded in-process; "
+                  "no republish helpers needed)",
+                  options->imageTopic().c_str(), options->image1Topic().c_str());
+    } else {
+      sub_img0_filter_ = std::make_shared<Subscriber<Image>>(
+          this, options->imageTopic(), image_qos, sub_opt_image);
 
-    sub_img1_filter_ = std::make_shared<Subscriber<Image>>(
-        this, options->image1Topic(), image_qos, sub_opt_image);
+      sub_img1_filter_ = std::make_shared<Subscriber<Image>>(
+          this, options->image1Topic(), image_qos, sub_opt_image);
 
-    sync_img_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
-        SyncPolicy(100), *sub_img0_filter_, *sub_img1_filter_);
+      sync_img_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
+          SyncPolicy(100), *sub_img0_filter_, *sub_img1_filter_);
 
-    sync_img_->registerCallback(std::bind(&VinsEstimator::stereoCallback, this,
-                                          std::placeholders::_1,
-                                          std::placeholders::_2));
+      sync_img_->registerCallback(std::bind(&VinsEstimator::stereoCallback, this,
+                                            std::placeholders::_1,
+                                            std::placeholders::_2));
+    }
   } else {
     auto sub_img0 = this->create_subscription<sensor_msgs::msg::Image>(
         options->imageTopic(), rclcpp::QoS(rclcpp::KeepLast(100)),
@@ -320,8 +349,7 @@ void VinsEstimator::initializeSubscribers() {
           ImageData image;
           image.image0 = fromMsg(*msg);
           image.timestamp = fromMsg(msg->header.stamp);
-          image.mask = maskFor(msg->header.stamp, image.timestamp,
-                               image.image0.size());
+          image.mask = maskFor(image.timestamp, image.image0.size());
           image.vote_boxes = vote_boxes_;
           logMask(msg->header.stamp);
           estimator_->inputImage(image);
@@ -335,15 +363,30 @@ void VinsEstimator::initializeSubscribers() {
         this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     auto dets_topic =
         readParam<std::string>(this, "dynamic_dets_topic", "/orbslam3/dynamic_dets");
-    if (!dets_csv_.empty()) {
-      loadDetsCsv(dets_csv_);
-      RCLCPP_INFO(this->get_logger(),
-                  "filter: ON -- masking from precomputed %s (dilate %d px, "
-                  "exact-stamp lookup, nearest within %.0f ms as fallback, max "
-                  "coverage %.0f%%)",
-                  dets_csv_.c_str(), mask_dilate_px_, det_max_age_ * 1e3,
-                  max_mask_fraction_ * 100.0);
-    } else {
+    {
+      // NOBODY STARTS THE DETECTOR FOR US. orbslam3_ros2 has a launch file that
+      // spawns dynamic_detector_node.py alongside the tracker; this package has
+      // none by design (it is a submodule and must not depend on a workspace
+      // sibling), so the detector is a separate terminal the operator has to
+      // remember. On 2026-09-16 it was not started for four Experiment 3 runs:
+      // the subscription was created, nothing ever published, and all 2563
+      // frames recorded matched=0 -- a run that looks complete and filtered
+      // nothing. The 10 s report said so, but only to a terminal nobody kept.
+      // Say it once, loudly, after the detector has had time to load torch.
+      dets_watchdog_ = this->create_wall_timer(
+          std::chrono::seconds(20), [this, dets_topic]() {
+            dets_watchdog_->cancel();
+            if (this->count_publishers(dets_topic) > 0) return;
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "filter is ON but NOTHING publishes %s after 20 s. This package "
+                "has no launch file, so the detector is a SEPARATE process:\n"
+                "    ros2 run orbslam3_ros2 dynamic_detector_node.py --ros-args "
+                "-p weights_path:=<.pt> -p image_topic:=/cam0/image_raw\n"
+                "Every frame will record matched=0 and the run will NOT be "
+                "comparable with its baseline.",
+                dets_topic.c_str());
+          });
       rclcpp::SubscriptionOptions sub_opt_dets;
       sub_opt_dets.callback_group = dets_callback_group_;
       dets_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
@@ -399,13 +442,49 @@ void VinsEstimator::initializerPublishers() {
 void VinsEstimator::stereoCallback(
     const sensor_msgs::msg::Image::ConstSharedPtr& img0,
     const sensor_msgs::msg::Image::ConstSharedPtr& img1) {
+  submitStereo(fromMsg(*img0), fromMsg(*img1), fromMsg(img0->header.stamp),
+               img0->header.stamp);
+}
+
+cv::Mat VinsEstimator::decodeCompressed(
+    const sensor_msgs::msg::CompressedImage& msg, const char* which) {
+  // Decode straight to GRAYSCALE rather than going through image_transport's
+  // plugin. The real rig's bags carry format "yuv422; jpeg compressed mono8":
+  // the plugin decodes the mono8 payload but stamps the output with the
+  // original yuv422 encoding, which implies two channels, and cv_bridge then
+  // rejects every frame ("step < width * byte_depth * num_channels"). VINS
+  // wants grayscale anyway. orbslam3_ros2 reads these same blobs the same way.
+  const cv::Mat im = cv::imdecode(cv::Mat(msg.data), cv::IMREAD_GRAYSCALE);
+  if (im.empty()) {
+    ++decode_failures_;
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                          "could not decode %s compressed frame (format \"%s\")",
+                          which, msg.format.c_str());
+  }
+  return im;
+}
+
+void VinsEstimator::stereoCompressedCallback(
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr& img0,
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr& img1) {
+  const cv::Mat im0 = decodeCompressed(*img0, "left");
+  const cv::Mat im1 = decodeCompressed(*img1, "right");
+  if (im0.empty() || im1.empty()) {
+    return;  // a half-decoded pair is worse than a dropped one
+  }
+  submitStereo(im0, im1, fromMsg(img0->header.stamp), img0->header.stamp);
+}
+
+void VinsEstimator::submitStereo(const cv::Mat& im0, const cv::Mat& im1,
+                                 double t,
+                                 const builtin_interfaces::msg::Time& stamp) {
   ImageData image;
-  image.image0 = fromMsg(*img0);
-  image.image1 = fromMsg(*img1);
-  image.timestamp = fromMsg(img0->header.stamp);
-  image.mask = maskFor(img0->header.stamp, image.timestamp, image.image0.size());
+  image.image0 = im0;
+  image.image1 = im1;
+  image.timestamp = t;
+  image.mask = maskFor(image.timestamp, image.image0.size());
   image.vote_boxes = vote_boxes_;
-  logMask(img0->header.stamp);
+  logMask(stamp);
   estimator_->inputImage(image);
 }
 
@@ -433,41 +512,8 @@ int64_t VinsEstimator::stampNs(const builtin_interfaces::msg::Time& t) {
          static_cast<int64_t>(t.nanosec);
 }
 
-void VinsEstimator::loadDetsCsv(const std::string& path) {
-  // script/yolo_precompute.py format: '#' provenance lines, a header, then one
-  // row per box as timestamp_ns,class,score,x0,y0,x1,y1. A frame with nothing
-  // detected is present with an empty class, so "no boxes" and "frame not in
-  // file" stay distinguishable -- only the latter counts as missed.
-  std::ifstream in(path);
-  if (!in) throw std::runtime_error("dets_csv: cannot open " + path);
-  std::string line;
-  std::size_t n_boxes = 0;
-  while (std::getline(in, line)) {
-    if (line.empty() || line[0] == '#' || line.rfind("timestamp_ns", 0) == 0)
-      continue;
-    std::stringstream ss(line);
-    std::string f[7];
-    int i = 0;
-    while (i < 7 && std::getline(ss, f[i], ',')) ++i;
-    if (i < 7) continue;
-    auto& v = dets_file_[std::stoll(f[0])];
-    if (f[1].empty()) continue;
-    const float x0 = std::stof(f[3]), y0 = std::stof(f[4]);
-    const float x1 = std::stof(f[5]), y1 = std::stof(f[6]);
-    if (x1 > x0 && y1 > y0) {
-      v.emplace_back(x0, y0, x1 - x0, y1 - y0);
-      ++n_boxes;
-    }
-  }
-  if (dets_file_.empty()) throw std::runtime_error("dets_csv: no frames in " + path);
-  RCLCPP_INFO(this->get_logger(),
-              "dets_csv: %zu frames, %zu boxes (%.2f per frame) from %s",
-              dets_file_.size(), n_boxes,
-              static_cast<double>(n_boxes) / dets_file_.size(), path.c_str());
-}
 
-cv::Mat VinsEstimator::maskFor(const builtin_interfaces::msg::Time& stamp,
-                               double t, const cv::Size& size) {
+cv::Mat VinsEstimator::maskFor(double t, const cv::Size& size) {
   // Always reset: a frame with no detection must not inherit the previous
   // frame's vote boxes, or its census would be charged to the wrong boxes.
   vote_boxes_.clear();
@@ -475,35 +521,7 @@ cv::Mat VinsEstimator::maskFor(const builtin_interfaces::msg::Time& stamp,
   if (filter_mode_ == "motion") applyPendingVotes();
 
   std::vector<cv::Rect2f> boxes;
-  if (!dets_file_.empty()) {
-    // Precomputed: the frame's own stamp, exactly. The nearest-within-tolerance
-    // fallback exists for a re-stamped replay and reports a nonzero age so a
-    // run that needed it is visible in yolo_mask.csv.
-    const int64_t ns = stampNs(stamp);
-    auto it = dets_file_.find(ns);
-    double age = 0.0;
-    if (it == dets_file_.end()) {
-      auto up = dets_file_.lower_bound(ns);
-      double best = det_max_age_;
-      for (auto cand : {up, up == dets_file_.begin() ? dets_file_.end()
-                                                      : std::prev(up)}) {
-        if (cand == dets_file_.end()) continue;
-        const double a = std::fabs(static_cast<double>(cand->first - ns)) * 1e-9;
-        if (a <= best) {
-          best = a;
-          it = cand;
-        }
-      }
-      if (it == dets_file_.end()) {
-        ++det_missed_;
-        last_ = LogRow{0, 0.0, false, -1.0, false};
-        return cv::Mat();
-      }
-      age = best;
-    }
-    boxes = it->second;
-    last_age_ = age;
-  } else {
+  {
     std::lock_guard<std::mutex> lk(dets_mu_);
     double best = det_max_age_;
     const std::vector<cv::Rect2f>* pick = nullptr;

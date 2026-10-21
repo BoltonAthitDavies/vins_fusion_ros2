@@ -81,6 +81,10 @@ class FeatureTracker {
   /// Tracked points dropped so far because they drifted onto a dynamic region.
   /// Diagnostic only; the node logs it so a run that filtered nothing is visible.
   size_t dynamic_dropped = 0;
+  /// Points culled by the stock min-distance rule in the same loop. Stock
+  /// behaviour, filter or not; kept so dynamic_dropped can be read against it
+  /// rather than against nothing.
+  size_t mindist_dropped = 0;
   cv::Mat fisheye_mask;
   cv::Mat prev_img, cur_img;
   vector<cv::Point2f> n_pts;
