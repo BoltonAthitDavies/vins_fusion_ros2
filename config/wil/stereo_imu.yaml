@@ -145,13 +145,65 @@ body_T_cam0: !!opencv-matrix
 #            0.0065240958, -0.9998832669,  0.0138162526,  0.0010121732,
 #            0.0112430044, -0.0137423283, -0.9998423592, -0.0003943868,
 #            0.0,           0.0,           0.0,           1.0]
+# UPDATED 2026-10-26 from camera_parameters_261026/261026camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0), same derivation as 2026-10-21:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.090258 m, relative rotation 4.72 deg (was 0.089723 m, 0.9669 deg on
+# 2026-10-21). NOTE the relative rotation grew ~5x between the two calibrations of
+# the same bracket; treat as a calibration-quality question until checked on a bag.
+# PREVIOUS value (2026-10-21), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9998579160, -0.0051040575, -0.0160653773, -0.0897173102,
+#          -0.0051169031, -0.9999866208, -0.0007585784, -0.0000049715,
+#          -0.0160612906,  0.0008406756, -0.9998706557, -0.0010314226,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# UPDATED 2026-10-27 from camera_parameters_271026/271026camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0), same derivation as 10-21 and 10-26:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.088418 m, relative rotation 1.29 deg (10-26: 0.090303 m / 4.72 deg; 10-21: 0.089723 m / 0.97 deg).
+# PREVIOUS value (2026-10-26), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9968834966, -0.0031961813, -0.0788230846, -0.0901712571,
+#          -0.0050462668, -0.9997161700, -0.0232833560, -0.0014758000,
+#          -0.0787262944,  0.0236085556, -0.9966166799,  0.0036627138,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# RE-UPDATED 2026-10-27 (13:48 revision): camera_parameters_271026/271026camera1_rot_trans.dat was regenerated after the
+# first 10-27 application; same derivation. Baseline 0.088827 m, relative rotation 1.15 deg.
+# PREVIOUS value (first 10-27 revision of the same .dat), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9998810533,  0.0082047679, -0.0130599033, -0.0883886225,
+#           0.0079883459, -0.9998313217, -0.0165382702, -0.0022479903,
+#          -0.0131933931,  0.0164319760, -0.9997779376,  0.0003213134,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# UPDATED 2026-10-28 from camera_parameters_281026/281026camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0), same derivation as before:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.089028 m, relative rotation 0.86 deg (10-27 13:48: 0.088830 m / 1.15 deg).
+# PREVIOUS value (2026-10-27 13:48 revision), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9999536454,  0.0044054398, -0.0085614905, -0.0888038145,
+#           0.0042535869, -0.9998347419, -0.0176747250, -0.0020094256,
+#          -0.0086379405,  0.0176374887, -0.9998071339,  0.0002223474,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
 body_T_cam1: !!opencv-matrix
   rows: 4
   cols: 4
   dt: f
-  data: [ 0.9998579160, -0.0051040575, -0.0160653773, -0.0897173102,
-         -0.0051169031, -0.9999866208, -0.0007585784, -0.0000049715,
-         -0.0160612906,  0.0008406756, -0.9998706557, -0.0010314226,
+  data: [ 0.9999581038,  0.0010089898,  0.0090979406, -0.0889903996,
+          0.0011175407, -0.9999281605, -0.0119341921, -0.0011567181,
+          0.0090852455,  0.0119438595, -0.9998873949, -0.0023003115,
           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
 
 # Feature tracker
