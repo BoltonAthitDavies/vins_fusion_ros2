@@ -1,0 +1,18 @@
+%YAML:1.0
+---
+model_type: KANNALA_BRANDT
+camera_name: cam1
+image_width: 1920
+image_height: 1080
+# Only one mono intrinsic calibration exists for this rig (fisheye_calibration.json),
+# so cam1 currently reuses cam0's intrinsics. Replace with a real cam1-specific
+# calibration if/when one is captured.
+projection_parameters:
+   k2: -3.6454649283899260e-02
+   k3: -8.4033940262664050e-04
+   k4: 1.7697497379393103e-04
+   k5: -3.8271157228233200e-04
+   mu: 6.0751086826537540e+02
+   mv: 6.0990538347480360e+02
+   u0: 9.5825580938647060e+02
+   v0: 5.3979750912834720e+02
