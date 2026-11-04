@@ -17,7 +17,8 @@
 #   - good excitation for initialization: wheel velocity reaches +/-1.29 m/s and
 #     gyro.z peaks at 1.29 rad/s over the run
 #
-# OUTSTANDING -- ACCELEROMETER SCALE ERROR:
+# HISTORICAL (August 2026 RealSense IMU; the current rig's IMU reads 9.8858, see g_norm) --
+# ACCELEROMETER SCALE ERROR:
 #   With the robot stationary the accelerometer magnitude reads 9.2642 m/s^2 (std 0.030)
 #   where true gravity is ~9.81 -- a consistent 5.6% shortfall, steady across the whole
 #   bag (9.2642 at the start, 9.2610 at the end), so it is a calibration error and not
@@ -247,8 +248,15 @@ keyframe_parallax: 10.0
 # TODO: re-derive properly with an Allan variance plot from several hours of stationary
 # logging (imu_utils / allan_variance_ros). Until then these are deliberately loose --
 # too-large noise degrades gracefully toward stereo-only, too-small does not.
-acc_n: 0.1              # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
-gyr_n: 0.01             # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+# 2026-11-03: acc_n / gyr_n INFLATED x10 to match ORB-SLAM3's real-rig setting (IMU.NoiseAcc 1.0,
+# IMU.NoiseGyro 0.1). On dataset_realv6_000 the previous values made ORB-SLAM3's inertial fusion run
+# away in most runs (1.1-9.6 m) while stereo-only tracked at 0.63 m; with x10 three consecutive ORB
+# runs scored 0.47-0.49 m. This IMU's camera-relative axis signs, lever arm and time offset are
+# unverified, so the optimizer must not over-trust it. Random walks unchanged. Previous values:
+# acc_n: 0.1              # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+# gyr_n: 0.01             # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+acc_n: 1.0              # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+gyr_n: 0.1              # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
 acc_w: 0.001            # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
 gyr_w: 0.0001           # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
 
@@ -260,7 +268,12 @@ gyr_w: 0.0001           # gyroscope bias random walk               [rad/s^2/sqrt
 # This is a WORKAROUND for the uncalibrated accelerometer, not a fix -- the 5.6% scale
 # error still corrupts dynamic accelerations, where bias estimation only partly absorbs
 # it. Run rs-imu-calibration.py, then set this back to 9.81007.
-g_norm: 9.2642          # observed, see note above
+# g_norm: 9.2642          # observed, see note above  (August 2026 RealSense; wrong for this rig)
+# 2026-11-04: the rig's IMU (/hwt101ct_yaw_publisher) reads |a| = 9.8858 m/s^2 at rest (measured
+# 29 Oct, see orbslam3_ros2/launch/wil_stereo_imu.launch.py ACCEL_SCALE; 9.878 on the 3 Nov bags).
+# VINS receives the raw samples (no scale applied), so the constraint must be the measured
+# magnitude. The 9.2642 left from the August RealSense made every realv6/realv7 VINS run diverge.
+g_norm: 9.8858          # measured at rest on the current rig, see note above
 
 # Online camera/IMU time-offset estimation. Worth having on for a rig where the camera
 # and IMU are not hardware-triggered together, which is the case here (separate USB

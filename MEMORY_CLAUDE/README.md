@@ -591,3 +591,9 @@ and starts **no** republishers. `republish:=true` restores them for a raw-only
 source. The configured `image0_topic`/`image1_topic` stay suffix-free in the
 YAML; `/compressed` is appended by the node, so one config serves both
 transports.
+
+## 2026-11-03 — real-rig IMU noise ×10 (acc_n 1.0, gyr_n 0.1) in config/wil and wil_311026_selfcal stereo_imu.yaml
+
+Mirrors the ORB-SLAM3 real-rig setting found the same day on dataset_realv6_000: with the copied densities (0.1 / 0.01) ORB-SLAM3's inertial fusion ran away in most runs (1.1–9.6 m) while stereo-only tracked at 0.63 m; with ×10 three consecutive ORB runs scored 0.47–0.49 m. Walks unchanged, previous lines kept as comments. NOT changed here: g_norm is still 9.2642 (the August IMU); the current IMU reads 9.88 m/s² at rest on realv5/realv6 and VINS diverged on realv6 with its accelerometer bias frozen at the 0.6 m/s² mismatch — fix g_norm before re-running VINS on real bags. RTAB-Map has no IMU noise parameters.
+
+> **2026-11-03:** every bag was rescued from the flash drive to `/media/ambushee/New Volume/wil_rescue/` (rsync, `rescue.log` there); paths to `/media/ambushee/32E4AAB1E4AA772F/` in this record mean that root now.
