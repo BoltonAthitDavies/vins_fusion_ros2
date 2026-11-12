@@ -224,7 +224,7 @@ body_T_cam1: !!opencv-matrix
 
 # Feature tracker
 multiple_thread: 1
-image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
+image_skip: 2            # every frame -> deterministic (default 2 causes a frame-skip race)
 max_cnt: 150
 min_dist: 30
 freq: 20
