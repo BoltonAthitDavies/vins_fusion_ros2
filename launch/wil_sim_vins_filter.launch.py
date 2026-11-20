@@ -119,6 +119,16 @@ def generate_launch_description():
             description="'auto' masks every class the chosen weight knows."),
         DeclareLaunchArgument('publish_debug_image', default_value='false'),
         DeclareLaunchArgument(
+            'fov_mask_deg', default_value='-1.0',
+            description='Mask tracker features beyond this field angle (deg) of cam0, '
+                        'built from its camera model. DEFAULT -1 = take the value from '
+                        "the config file's fov_mask_deg key, which is where it belongs "
+                        '(the real-rig configs carry 70, the pinhole sim configs carry '
+                        'nothing and so get 0). Pass 0 to switch the mask off '
+                        'deliberately, or any angle to override the config. A default of '
+                        '0 here silently overrode the config and cost a real-rig run on '
+                        '2026-11-17 -- do not reinstate it.'),
+        DeclareLaunchArgument(
             'image_transport', default_value='compressed',
             description="'compressed' (default) -- VINS decodes the JPEG "
                         'itself, so no republish helpers are needed at all. '
@@ -177,6 +187,7 @@ def generate_launch_description():
             'filter': LaunchConfiguration('filter'),
             'filter_mode': LaunchConfiguration('filter_mode'),
             'image_transport': LaunchConfiguration('image_transport'),
+            'fov_mask_deg': LaunchConfiguration('fov_mask_deg'),
         }],
     )
 

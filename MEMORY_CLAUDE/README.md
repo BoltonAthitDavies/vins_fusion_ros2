@@ -597,3 +597,271 @@ transports.
 Mirrors the ORB-SLAM3 real-rig setting found the same day on dataset_realv6_000: with the copied densities (0.1 / 0.01) ORB-SLAM3's inertial fusion ran away in most runs (1.1–9.6 m) while stereo-only tracked at 0.63 m; with ×10 three consecutive ORB runs scored 0.47–0.49 m. Walks unchanged, previous lines kept as comments. NOT changed here: g_norm is still 9.2642 (the August IMU); the current IMU reads 9.88 m/s² at rest on realv5/realv6 and VINS diverged on realv6 with its accelerometer bias frozen at the 0.6 m/s² mismatch — fix g_norm before re-running VINS on real bags. RTAB-Map has no IMU noise parameters.
 
 > **2026-11-03:** every bag was rescued from the flash drive to `/media/ambushee/New Volume/wil_rescue/` (rsync, `rescue.log` there); paths to `/media/ambushee/32E4AAB1E4AA772F/` in this record mean that root now.
+
+## 15. Real-rig divergence ROOT-CAUSED: fisheye features beyond ~77 deg of field angle (2026-11-15)
+
+Every real-rig VINS run to date diverged (realv6 217 resets; realv7_000/001/002 to 5-37 km).
+The pasted-in analysis blamed the stale `g_norm` plus 40-45 % frame delivery. Both were
+real but neither was the cause: with `g_norm` corrected the runs still diverged, and a
+**stereo-only run (imu:0) diverged too** (`realv7_001/stereo_only`, position 1e8 m), so the
+inertial side was exonerated. Chain of evidence, all on `dataset_realv7_001`:
+
+1. **Static phase is fine with the extrinsics fixed.** With `estimate_extrinsic:1` the
+   estimator drifted while the robot stood still (GT 0.00 m/s, parallax 0.1-0.3 px): both
+   camera blocks are freed once the OLDEST window frame exceeds 0.2 m/s, which a false
+   velocity reached within a second. `estimate_extrinsic:0` held the pose at 0.00 for
+   the whole 4.5 s static phase. Extrinsics are now logged per frame (`extrinsics.csv`).
+2. **Failure is at motion onset and is a backend purge, not lost tracking.** At 7.27 s
+   (first keyframe after the robot rolls) 98 of 151 features are rejected in ONE frame,
+   146 at 7.53 s, each right after the solve pushed the accel bias to 2-3 m/s^2. Offline,
+   the node's exact KLT recipe keeps 96-100 % of corners at 30/15/7.5 Hz through the
+   same frames; no blur (Laplacian var 540-650); frames arrived at the full 33 ms.
+3. **Stereo-only diverges identically at 7.5 s** with `last_average_parallax` = 6740
+   (normalised units x460) at that keyframe. That number is only possible for features
+   with |x/z| of order 10: field angle > 84 deg.
+4. **The lens.** `cam0_fisheye.yaml` (mu 607.5, k2..k5): r(60/75/77/80/85/90 deg) =
+   610/742/758/782/819/853 px from the principal point (958, 540). The lens circle on the
+   frames reaches ~900 px (mean grey 114 to 900 px, 21 beyond), i.e. ~100 deg, and the
+   frame's left/right edges sit at 960 px. The stock detector (150 corners, min_dist 30)
+   puts 11-35 % of corners beyond 77 deg, 4-21 % beyond 85 deg, 1-11 % AT/BEYOND 90 deg,
+   and 1-15 % on the bright-to-black lens rim. VINS maps every lifted ray to the
+   normalised plane as (x/z, y/z) (`feature_tracker.cpp` undistortedPts, ~L509/L579):
+   |x/z| -> inf at 90 deg and flips sign beyond. ORB-SLAM3's KannalaBrandt8 never divides
+   by z, which is why ORB tracks this rig at 0.17-0.63 m and VINS never did. Upstream
+   VINS handles wide lenses with a static `fisheye_mask`; this port's member of that name
+   was never loaded.
+
+**Fix: node parameter `fov_mask_deg` (default 0 = off).** Builds a CV_8UC1 mask once from
+the cam0 camera model (`CameraFactory` -> `spaceToPlane` of the cone, so exact for KB,
+mu != mv) and ANDs it into `ImageData::mask`, i.e. through the same `setMask()` seeding
+the YOLO filter uses: tracked points that drift past the limit are culled and no new
+corners are seeded there. Launch arg of the same name in both WiL launch files;
+recorded in `run_metadata.csv`. At 70 deg, 65 % of the frame is kept.
+
+**Result, realv7_001, rate 1.0, scored with eval_real_gt.py (wheel offset -3.766 s,
+r 0.98, lever arm 0, so "provisional"):**
+
+| run | config | resets | ATE RMSE | median | RPE 1 s | path est/GT |
+|---|---|---|---|---|---|---|
+| stereo_only | stereo.yaml, no mask | 0 | diverged (1e8 m) | | | |
+| stereo_only_fov70 | stereo.yaml, 70 deg | 0 | 0.846 m | 0.772 | 0.096 | 1.14 |
+| imuz180_fov70 | stereo_imu + R=diag(-1,-1,1), extr/td FREE, 70 deg | 0 | 1.036 m | 0.859 | 0.097 | 0.75 |
+| stock_fov70 | stereo_imu (R=diag(1,-1,-1)), extr/td FREE, 70 deg | 0 | 1.307 m | 1.136 | 0.149 | 0.67 |
+| extr0_td0_fov70 | stereo_imu, extr+td FIXED, 70 deg | 0 | 0.739 m | 0.724 | 0.091 | 1.13 |
+| imuz180_extr0_td0_fov70 | both of the above | 0 | 0.733 m | 0.712 | 0.090 | 1.13 |
+| skip1_fov70 | + `image_skip` 1 | 0 | 0.713 m | 0.700 | 0.090 | 1.13 |
+| accn01_fov70 | + `acc_n` 0.1 / `gyr_n` 0.01 | 0 | 0.686 m | 0.677 | 0.090 | 1.13 |
+| **settled** | **config/wil/stereo_imu.yaml as edited 17 Nov** | 0 | **0.678 m** | 0.676 | 0.090 | 1.13 |
+
+The mask alone turns every arm from divergent to completed.
+
+**`estimate_extrinsic:1` (and `estimate_td:1`) is the second real defect, not the IMU.**
+The first three rows were all run with both free, and on that evidence (16 Nov) this
+record wrongly concluded "the inertial arms are worse than stereo-only, so the IMU has a
+remaining defect". Holding the calibration fixed reverses it: 1.31/1.04 -> 0.739/0.733 m,
+path ratio 0.67/0.75 -> 1.13, and stereo-inertial now BEATS stereo-only (0.846 m). The
+free-extrinsic runs' under-scaling was the optimiser eating the baseline, which point 1
+above had already shown it does within a second of a start.
+
+**`config/wil/stereo_imu.yaml` now CARRIES the settled values** (17 Nov): `estimate_extrinsic 0`,
+`estimate_td 0`, `body_T_cam0` R = `diag(-1,-1,1)` with cam1 re-derived (stereo relative
+bit-identical, baseline 0.091710 m), `acc_n 0.1` / `gyr_n 0.01`, `image_skip 2`. The file
+itself was then run through `wil_vins_filter.launch.py` with `fov_mask_deg:=70` and scores
+**0.678 m** (run dir `settled`), against ORB-SLAM3 LC-GPU 0.450 m on the same bag. Its
+header opens with a block stating that `fov_mask_deg:=70` must be passed, since that is a
+node parameter and omitting it silently voids the run.
+
+**`acc_n`/`gyr_n`: the x10 inflation of 3 Nov is reverted.** It was a workaround for
+ORB-SLAM3's runaway, whose cause was different; 1.0/0.1 gives 0.733 m, 0.1/0.01 gives
+0.686 m. Random walks never A/B'd.
+
+**The mask angle now lives in the CONFIG FILE, not the launch command (17 Nov).** It was
+first a ROS parameter only, and the same afternoon a real-rig run launched without the
+argument diverged exactly as the pre-fix runs did -- a value that must never be forgotten
+does not belong in an optional argument. `fov_mask_deg` is now a key read by `VINSOptions`
+(absent = 0, so the pinhole sim configs are untouched); `config/wil/stereo_imu.yaml` and
+`config/wil/stereo.yaml` carry 70.0. The ROS parameter still overrides the file and warns
+when it disagrees, and the node logs a line at startup when it is running unmasked. BOTH
+WiL launch files default the argument to **-1** = "take it from the config"; their earlier
+default of 0.0 silently overrode the file and is what cost that run, so do not reinstate it.
+Verified by replaying the user's command verbatim with no mask argument: 0.708 m ATE
+(`rate1_003`), against 0.678 m for the same config run with the argument given explicitly
+(`settled`) -- a 0.030 m spread over two identical-input runs, which is this estimator's own
+repeatability and the floor below which no config comparison here means anything.
+
+**Stereo calibration generation: the 3 Nov one is right, and it is not close.** Only
+`camera_parameters_101126/` (10 Nov) still exists on disk beside it; run under the settled
+settings it gives **72.8 m** ATE and a path 60x ground truth (`cal1110`), against 0.678 m for
+the 3 Nov calibration in the live file. Worth noting WHY this was never caught: with
+`estimate_extrinsic:1` the optimiser absorbed calibration error, so the four generations were
+indistinguishable and untested. Fixing the extrinsics is what makes the calibration choice
+matter -- a wrong one is now fatal rather than invisible, so re-score any future calibration
+on a bag before adopting it.
+
+**`image_skip`: stays 2, and 1 is a trap.** At 1 the ATE looked better (0.713 vs 0.733 m)
+but that is inside VINS's own 3-7 % spread, while the backend queue wait went 7.6 -> 18.5 ms
+mean and 207 -> 511 ms max and **15 % FEWER pairs reached the node at all** (971 vs 1147):
+the image callback falls behind and frames are lost before the tracker sees them,
+nondeterministically. The key's comment used to claim "every frame -> deterministic" while
+the value was 2 (copied from `config/wil_sim/`, where it really is 1); both measurements are
+now in the comment. Revisit on faster hardware.
+
+70 deg was the first value tried, not a sweep; one bag; lever arm still zero, so every
+number above is "provisional" in the scorer's sense.
+
+### 15.0 The whole real campaign, re-run with the settled config (17 Nov)
+
+User-run, `config/wil/stereo_imu.yaml` as it now stands (mask from the file, no launch
+argument), rate 1.0, scored by `script/eval_real_gt.py` against the tracker; lever arm still
+zero so all VINS rows are "provisional". ORB-SLAM3 column is its loop-closing GPU arm
+(`*_lc_gpu_p15`) on the same bags, for scale.
+
+| bag | VINS run | resets | VINS ATE | median | RPE 1 s | path | ORB-SLAM3 |
+|---|---|---|---|---|---|---|---|
+| realv6_000 | rate1_002 | 0 | 0.786 m | 0.518 | 0.048 | 0.82 | 0.478 m |
+| realv7_000 | rate1_002 | 0 | 0.464 m | 0.434 | 0.064 | 1.10 | 0.268 m |
+| realv7_001 | settled / rate1_003 | 0 | 0.678 / 0.708 m | 0.676 | 0.090 | 1.13 | 0.450 m |
+| realv7_002 | rate1_002 | 0 | 0.374 m | 0.334 | 0.055 | 1.11 | 0.172 m |
+
+**Every real bag now tracks.** realv6 went from 217 resets and no usable trajectory to zero
+resets and 0.786 m. VINS is consistently 1.7-2.2x ORB-SLAM3's error on this rig and runs
+8-13 % long on path, but it is in the same class and the failures are gone.
+
+`realv6_000` is reported by the scorer as **"failed (ground truth invalid)"**, and that is the
+REFERENCE, not the run: the tracker export has a 2.44 s gap, which breaks the scorer's own
+`gap_ok` rule (no gap > 1.0 s). The estimate itself is healthy -- 0 resets, RPE 0.048 m, 247 of
+248 samples matched. Quote the number with that caveat, or fix the export; do not report
+realv6 as a VINS failure.
+
+### 15.0.1 Candidate sweep: nothing beats the settled file yet
+
+**The repeatability floor, measured properly.** THREE runs of the unchanged file on the same
+bag with identical input (`settled`, `rate1_003`, `rate1_002`) gave 0.676 / 0.678 / 0.708 m:
+mean 0.687, sd 0.018, full range 0.032 m. So the bar a candidate has to clear is
+**mean - 2sd = 0.652 m**, and anything between 0.65 and 0.72 m is this estimator talking to
+itself. Measure this before any sweep on a new bag; it is three runs and it decides what the
+sweep can possibly conclude. (Independently consistent with the project's own note that VINS
+repeats to 3-7 %: 0.018/0.687 = 2.6 %.) Scored so far:
+
+| candidate | change | ATE | RPE 1 s | verdict |
+|---|---|---|---|---|
+| **reference** | `config/wil/stereo_imu.yaml` | **0.676 / 0.678 / 0.708 m** | 0.090 | three runs, identical input: mean 0.687, sd 0.018, range 0.032 m |
+| c1_fov60 | `fov_mask_deg` 70 -> 60 | 0.701 m | 0.089 | inside the floor, no change |
+| c2_fov77 | `fov_mask_deg` 70 -> 77 | 0.680 m | 0.090 | inside the floor, no change |
+| c5_features | `min_dist` 15, `max_cnt` 250 | 0.704 m | 0.090 | inside the floor AND 6x the queue wait (43 vs 7 ms mean) -- reject on cost |
+| c6_parallax | `keyframe_parallax` 10 -> 5 | 0.713 m | 0.090 | inside the floor, no change |
+| c3_td01 | `td` 0.0 -> +0.1 s | 0.767 m | 0.101 | **clearly WORSE** -- see below |
+| c4_leverarm | cam0 t -> (0, +0.26, +0.065) m | **0.649 m** | **0.081** | best of any run on this bag, but see below |
+
+**The mask angle is flat between 60 and 77 deg** (0.701 / 0.678-0.708 / 0.680 m). It is not a
+tuning knob: either the bad features are excluded or they are not, and anywhere in that range
+excludes them. Stop sweeping it. 70 stays, and the choice is now evidence-based rather than a
+first guess.
+
+**More features is a pure cost.** `min_dist` 15 with `max_cnt` 250 bought nothing (0.704 m) and
+sextupled the mean backend queue wait, which is the mechanism that loses frames on this laptop.
+
+**`td` +0.1 s is clearly worse (0.767 m, RPE 0.090 -> 0.101), and that is informative.** It is
+what a correctly-sized offset applied BACKWARDS looks like. The measurement says image motion
+lags the gyro by +70..+130 ms, so the frame stamped t shows the world at t-0.1; VINS applies
+`currentTimestamp = frame_stamp + td`, so the correction needs td NEGATIVE. c3 tested the sign
+I guessed, not the sign the derivation gives -- `stereo_imu_c7_tdm01.yaml` (td -0.1) tests that.
+If BOTH signs are worse than 0.0, VINS's td is not the quantity cross-correlation measured and
+this line is dead.
+
+**`c4_leverarm` is the only candidate that clears the bar, and only just.** 0.649 m against a
+threshold of 0.652 m -- it beats three reference runs by 2 sd with a sample of one, which is
+suggestive and nothing more. The stronger signal is the RPE: 0.081 m against 0.090 for every
+other run on this bag, and RPE is far less sensitive to the global fit than ATE is. Two runs settle it: a repeat of c4 under a second name, and
+`stereo_imu_c8_leverarm_backward.yaml`, which reverses ONLY the forward component to
+(0, +0.26, -0.065). If the arm is real, c8 must be clearly worse than c4; if c8 matches c4, the
+arm is not what moved the number. The +0.26 m vertical component is not in question -- it is the
+large one and its sign is fixed by the accelerometer reading +9.87 on y at rest.
+
+### 15.1 The IMU rotation is also wrong, by 180 deg about the vertical — but VINS cannot see it
+
+Measured on all four real bags from the wheel feedback and the accelerometer, straight
+segments only (steering 0): the first start-up reads +0.24/+0.52/+0.49/+0.62 m/s^2 on
+IMU **z** (realv6, v7_000, v7_002, v7_001) and the final stops read -0.31/-0.49/-0.52,
+while optical-flow expansion shows the camera travelling FORWARD (optical +z). So IMU +z
+= forward; `body_T_cam0 = diag(1,-1,-1)` maps forward to body -z. The correct rotation
+is `diag(-1,-1,1)`: the RealSense is turned 180 deg about its OPTICAL axis, not about x.
+Gravity stays on +y and the yaw-rate sign is unchanged under both, which is exactly why
+the realv5 gyro check (ORB record) called the x/z flip "undecidable". The cross-check
+against ORB's body-frame velocity on realv7_001 (7-10 s) gives (-0.15, 0, -0.37) vs IMU
+strapdown (+0.18, 0, +0.29): opposite in x and z, same in y. ORB-SLAM3's `IMU.T_b_c1`
+carries the same wrong rotation. Config variant `config/wil/stereo_imu_imuz180.yaml`
+(cam1 re-derived by left-multiplying R_y(180); baseline and cam0_T_cam1 unchanged).
+
+**It changes no VINS number, and the "1.307 -> 1.036 m" first written here was not the
+rotation.** `diag(1,-1,-1)^T @ diag(-1,-1,1) = diag(-1,1,-1)`, i.e. exactly 180 deg about
+body **y** — and y is the gravity axis on this rig. Rotation about gravity is the
+unobservable yaw gauge VINS fixes arbitrarily in `initFirstIMUPose` (`g2R` then yaw
+zeroed), and with the extrinsics fixed and the lever arm zero nothing else couples to it.
+Measured with both held fixed: 0.739 vs 0.733 m ATE (0.006 m, noise) and the scorer's
+yaw alignment differs by 179.8 deg (-80.8 vs +99.0), which is the gauge rotation showing
+up where it should. The earlier 1.307/1.036 gap was two different SEEDS for a free
+`estimate_extrinsic`, converging differently. So: fix the rotation because it is the
+physical truth and because it WILL matter once the lever arm is non-zero — but never
+quote an accuracy gain for it. **ORB-SLAM3 is the opposite case: its `IMU.T_b_c1` already
+carries a non-zero translation (0.26 m below, 0.065 m backward), so there the 180 deg
+error does move the lever arm and must be fixed with its own A/B.**
+
+### 15.2 Two estimator defects fixed the same day (both bit on realv6/realv7)
+
+- `resetState()` cleared `imuBuffer`. Frames are processed up to ~3 s after their IMU
+  arrived (JPEG decode + KLT ~70 ms per pair against a 30 Hz stream, reliable depth-100
+  queue), so after a reset every frame found only IMU newer than itself, got one
+  interpolated sample with a clamped dt, re-initialised on garbage and tripped the
+  IMU-gap check again: the 217-reset (realv6) and 125-reset (realv7_001) loops. Fixed:
+  the buffer is kept across resets.
+- The online camera-IMU offset `td` lived in `options->time_delay`, was never restored
+  on reset (realv6 jumped +0.018 -> -2.51 s in one solve and stayed there), and had no
+  bound. Fixed: `configured_time_delay_` restored on reset; |td| > 0.2 s forces a reset
+  logged as `td_runaway`; new `td_runaway_resets` row in run_summary.csv.
+- Measured camera-IMU latency from the bags (image flow vs gyro cross-correlation):
+  +70..+130 ms in every window, constant. Header stamps lead receive time by 13 ms
+  (cameras) and 0 ms (IMU); no clock problem.
+
+### 15.3 Things ruled out today, so they are not re-tried
+
+g_norm (9.8858 parses, IMU reads 9.867-9.877 at rest on all bags); stereo baseline collapse
+(baseline logged constant at 0.09171 with extrinsics fixed); camera-side swap (cam1 LEFT,
+d = -6 px, matches both configs); a multi-second camera lag (70-130 ms measured); KLT
+failure at motion onset (96-100 % survival offline); motion blur; the IMU orientation
+field (parsed, never used); IMU bursts at the node (imu_recv tracks the bag).
+
+### 15.4 Open
+
+Done 17 Nov: the settled values are in `config/wil/stereo_imu.yaml` and the six diagnostic
+variants were deleted (their measurements are the table above; the configs themselves are
+reconstructible from it, and keeping a superseded config beside its replacement is the
+trap this project has already been bitten by).
+
+Still open, in order:
+1. **`fov_mask_deg` has one data point (70).** Sweep 60/70/77/80 on realv7_001; the
+   normalised coordinate passes |x/z| = 4 at 76 deg, so the useful range is narrow. Note the
+   repeatability floor measured on 17 Nov: two runs of the SAME config and bag gave 0.678 and
+   0.708 m, so only differences well above 0.03 m are real.
+2. **The marker lever arm is zero**, so every number is "provisional" and `estimate_extrinsic`
+   cannot responsibly go back to 1. Tape-measure it, or reuse ORB's figures with the z sign
+   taken from the corrected rotation.
+3. **A fixed `td` of ~0.1 s.** The real camera-IMU offset measured from the bags is
+   +70..+130 ms, constant; the file ships `td: 0.0`, i.e. wrong by about a frame.
+4. **Re-run realv6, realv7_000 and realv7_002** with the settled config; only realv7_001 has
+   been run this way.
+5. **ORB-SLAM3's `IMU.T_b_c1`** needs the same 180 deg rotation fix and its own A/B -- its
+   lever arm is NON-zero (0.26 m below, 0.065 m back), so there the error is real.
+6. **`wil_311026_selfcal/`** is still a realv6 stopgap. `config/wil/stereo_imu_101126.yaml`
+   is the 10 Nov calibration, now SCORED AND REJECTED (72.8 m) -- delete it or mark it so.
+7. `rate1_001` under realv6 is VOID (two nodes wrote it at once).
+
+**Report impact:** tables 4.16 and 4.18 and the real-rig mechanism paragraph attribute
+the VINS failures to `g_norm` and 40-45 % frame delivery. Both are disproved; the
+mechanism is the fisheye normalisation plus the free extrinsic. Chapter 4's real-robot
+slot needs rewriting once the campaign is re-run.
+
+**Report impact:** tables 4.16 and 4.18 and the real-rig mechanism paragraph attribute
+the VINS failures to `g_norm` and 40-45 % frame delivery. Both are disproved; the
+mechanism is the fisheye normalisation plus the free extrinsic. Chapter 4's real-robot
+slot needs rewriting once the campaign is re-run.

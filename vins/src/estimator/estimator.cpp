@@ -16,6 +16,8 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <cmath>
+
 namespace {
 double processCpuMs() {
   struct rusage usage {};
@@ -51,10 +53,15 @@ Estimator::~Estimator() {
 
 void Estimator::resetState() {
   ++total_resets_;
-  {
-    std::lock_guard<std::mutex> imu_lock(imu_mutex);
-    clearBuffer(imuBuffer);
-  }
+  // Keep imuBuffer. On the real rig the image path (JPEG decode + KLT, ~70 ms per
+  // pair at 1920x1080) runs behind the 30 Hz stream and frames are processed up
+  // to ~3 s after their IMU samples arrived. Clearing the buffer here threw those
+  // samples away, so every frame after a reset found only IMU newer than itself,
+  // got one interpolated sample with a clamped dt, re-initialised on garbage,
+  // and the first NON_LINEAR frame tripped the IMU-gap check again: 217 resets
+  // on realv6 (3 Nov) and 125 on realv7_001 (15 Nov) were this loop. The buffer
+  // is bounded by consumption; getIMUInterval() drops anything up to the frame
+  // it is asked for, and processIMU() ignores samples while frameCount == 0.
   {
     std::lock_guard<std::mutex> feature_lock(featureBufferMutex);
     clearBuffer(featureBuffer);
@@ -68,6 +75,14 @@ void Estimator::resetState() {
   // every reset -- which is exactly what happened. Rely on the caller's lock instead.
   previousTimestamp = -1;
   currentTimestamp = 0;
+  // The optimiser's td estimate lives in options->time_delay. A reset that keeps
+  // it re-initialises with the same (possibly diverged) offset -- the realv6
+  // 217-reset loop. Start the new window from the configured value.
+  if (options->time_delay != configured_time_delay_) {
+    VINS_WARN << "restoring camera-IMU time offset " << options->time_delay
+              << " s -> configured " << configured_time_delay_ << " s";
+    options->time_delay = configured_time_delay_;
+  }
   openExEstimation = 0;
   inputImageCount = 0;
   isFirstPoseInitialized = false;
@@ -102,10 +117,17 @@ void Estimator::resetState() {
 void Estimator::initialize(std::shared_ptr<VINSOptions> options_) {
   std::lock_guard<std::mutex> lock(processingMutex);
   options = options_;
+  configured_time_delay_ = options->time_delay;
   initializeCamerasFromOptions();
   if (!options->OUTPUT_FOLDER.empty()) {
     performance_log_.open(options->OUTPUT_FOLDER + "/performance.csv",
                           std::ios::out | std::ios::trunc);
+    extrinsic_log_.open(options->OUTPUT_FOLDER + "/extrinsics.csv",
+                        std::ios::out | std::ios::trunc);
+    if (extrinsic_log_)
+      extrinsic_log_ << "timestamp_ns,extrinsic_free,cam0_tx,cam0_ty,cam0_tz,cam0_qw,cam0_qx,"
+                        "cam0_qy,cam0_qz,cam1_tx,cam1_ty,cam1_tz,cam1_qw,cam1_qx,cam1_qy,"
+                        "cam1_qz,baseline_m\n";
     events_log_.open(options->OUTPUT_FOLDER + "/events.csv",
                      std::ios::out | std::ios::trunc);
     frontend_log_.open(options->OUTPUT_FOLDER + "/frontend.csv",
@@ -470,6 +492,22 @@ void Estimator::processMeasurements() {
           << active_state.gyro_bias.norm() << ',' << active_state.velocity.norm() << '\n';
       backend_log_.flush();
     }
+    if (extrinsic_log_) {
+      extrinsic_log_.setf(std::ios::fixed, std::ios::floatfield);
+      extrinsic_log_.precision(0);
+      extrinsic_log_ << feature.first * 1e9 << ',' << openExEstimation;
+      extrinsic_log_.precision(7);
+      for (int i = 0; i < options->getNumCameras(); i++) {
+        const Quaterniond q(cameraRotation[i]);
+        extrinsic_log_ << ',' << cameraTranslation[i].x() << ',' << cameraTranslation[i].y()
+                       << ',' << cameraTranslation[i].z() << ',' << q.w() << ',' << q.x()
+                       << ',' << q.y() << ',' << q.z();
+      }
+      if (options->getNumCameras() == 2)
+        extrinsic_log_ << ',' << (cameraTranslation[1] - cameraTranslation[0]).norm();
+      extrinsic_log_ << '\n';
+      extrinsic_log_.flush();
+    }
     if (state_log_) {
       const Quaterniond q(active_state.rotation);
       state_log_.setf(std::ios::fixed, std::ios::floatfield);
@@ -555,6 +593,7 @@ void Estimator::writeRunSummary() {
       << initialization_time << '\n'
       << "resets," << total_resets_.load() << '\n'
       << "imu_gap_resets," << imu_gap_resets_.load() << '\n'
+      << "td_runaway_resets," << td_runaway_resets_.load() << '\n'
       << "failure_resets," << failure_resets_.load() << '\n'
       << "failure_detection_enabled,0\n"
       << "solver_calls," << total_solver_calls_.load() << '\n'
@@ -824,6 +863,21 @@ void Estimator::processNonLinearSolver(Timestamp timestamp) {
       std::chrono::steady_clock::now() - triangulation_start).count();
 
   optimize();
+  // A time offset this large is a diverged solve, not a sensor property. Left
+  // in place it shifts every later IMU interval and the estimator never
+  // recovers; reset now, with the configured td (resetState restores it).
+  if (options->shouldEstimateTD() &&
+      std::fabs(options->time_delay) > MAX_TIME_DELAY) {
+    VINS_WARN << "camera-IMU time offset estimate " << options->time_delay
+              << " s exceeds " << MAX_TIME_DELAY
+              << " s; re-initializing with the configured value.";
+    failure_occur = 1;
+    ++td_runaway_resets_;
+    logEvent(timestamp, "reset", "td_runaway");
+    resetState();
+    initializeCamerasFromOptions();
+    return;
+  }
   set<int> removeIndex;
   const auto outlier_start = std::chrono::steady_clock::now();
   outliersRejection(removeIndex);

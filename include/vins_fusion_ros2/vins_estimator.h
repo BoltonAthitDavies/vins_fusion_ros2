@@ -168,6 +168,20 @@ class VinsEstimator : public rclcpp::Node {
   double last_age_ = -1.0;
   std::ofstream mask_log_;
   std::string output_path_;
+  /// Static field-of-view mask for cam0 (255 keep, 0 drop), built once from the
+  /// camera model: everything beyond fov_mask_deg of field angle is masked. VINS
+  /// puts every feature on the normalised image plane (x/z, y/z of the lifted
+  /// ray); on this rig's ~200 deg fisheye the lens circle reaches ~100 deg and 90
+  /// deg falls at 853 px from the principal point, inside the 1920 px frame, so
+  /// corners near the left/right edges and on the bright-to-black lens rim lift to
+  /// |x/z| -> inf or flip sign. On dataset_realv7_001 (15 Nov 2026) that gave a
+  /// 6740 'px' average parallax at the first keyframe after motion onset, 137
+  /// features rejected in one frame and divergence to 1e8 m with NO IMU at all.
+  /// Upstream VINS carries a static fisheye_mask image for exactly this; this
+  /// port's member of that name was never loaded. 0 (default) = no mask.
+  double fov_mask_deg_ = 0.0;
+  cv::Mat fov_mask_;
+  cv::Mat fovMaskFor(const cv::Size& size);
 
   std::size_t det_matched_ = 0;
   std::size_t det_missed_ = 0;

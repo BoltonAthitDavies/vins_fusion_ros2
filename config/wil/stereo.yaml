@@ -166,6 +166,12 @@ body_T_cam1: !!opencv-matrix
 
 # Feature tracker
 multiple_thread: 1
+
+# Mask tracker features beyond this field angle of cam0 (degrees). Same lens, same
+# requirement as config/wil/stereo_imu.yaml: without it this stereo-only arm diverged to
+# 1e8 m on dataset_realv7_001, which is how the fisheye normalisation was isolated from the
+# IMU in the first place. With it, 0.846 m ATE. See record section 15.
+fov_mask_deg: 70.0
 image_skip: 1            # every frame -> deterministic (default 2 causes a frame-skip race)
 max_cnt: 150
 min_dist: 30

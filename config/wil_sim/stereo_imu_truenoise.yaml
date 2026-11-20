@@ -1,33 +1,55 @@
 %YAML:1.0
+
 # ---------------------------------------------------------------------------
-# TRUE-IMU-NOISE TREATMENT (created 2026-09-18)
+# MEASURED-IMU-NOISE TREATMENT (mean of the four recordings).
+# Generated 2026-11-13 from vins_fusion_ros2/config/wil_sim/stereo_imu.yaml.
 #
-# Identical to stereo_imu.yaml in every respect EXCEPT the four IMU noise
-# parameters, which are set to the values the simulator actually injects rather
-# than the deliberately inflated ones. Derived from the <imu> sensor block of
-# aws-robomaker-small-warehouse-world/models/ackermann_robot/model.sdf at its
-# 200 Hz update rate:
+# Identical to that file except the four IMU noise parameters, which are the
+# noise model the EKF "measured noise (diag.)" arm of table 4.3 was given,
+# averaged over the four realistic recordings.  Source models:
+#   output/compare/simulation/exp1-realistic/noise/<bag>/sensor_noise.yaml
+# consumed by output/output_ekf_measured/simulation/<bag>/.
 #
-#   gyro  per-sample sigma 0.0048   rad/s   -> 0.0048/sqrt(200) = 3.39411e-4
-#   accel per-sample sigma 0.0566   m/s^2   -> 0.0566/sqrt(200) = 4.00222e-3
+# The four bags were calibrated separately and do not agree:
+#   bag                      gyro density z      accel density x
+#   realistic_000             3.4891e-04                1.6245e-02
+#   realistic_001             3.5509e-04                1.5140e-02
+#   realistic_002             3.1123e-04                1.8029e-02
+#   realistic_003             3.5133e-04                2.4489e-02
+#   mean                     3.4164e-04                1.8476e-02
+# One config cannot carry four, so this file holds the mean and the per-recording
+# files stereo_imu_truenoise_realistic_000..003.yaml hold the exact models.  Use
+# THOSE when the point is parity with table 4.3, each paired with its OWN bag;
+# use this one when a single config must serve all four.  Its accel is up to
+# 25 % off realistic_003.
 #
-# The SDF models bias as first-order Gauss-Markov, not a random walk, so the
-# equivalent driving density is sigma_b*sqrt(2/tau):
+# WHY THESE FILES EXIST.  stereo_imu.yaml inflates the IMU noise ~5x, per the
+# usual VINS advice.  Experiment 1's EKF baseline is run twice: once on that same
+# inflated model ("EKF, VSLAM-config noise") and once on a model measured from
+# the recording ("EKF, measured noise (diag.)").  Table 4.3 reports both, and the
+# measured-noise filter is far the more accurate.  That leaves an uncontrolled
+# variable in the estimator comparison -- the filter may win because it is better
+# informed about its sensors, not because dead reckoning is better.  This file
+# hands VINS-Fusion the same numbers, changing one factor and nothing else.  The
+# ORB-SLAM3 counterparts are orbslam3_ros2/config/wil_sim/stereo_imu_truenoise*;
+# the key names differ but the quantities are identical, acc_n == IMU.NoiseAcc,
+# gyr_n == IMU.NoiseGyro, gyr_w == IMU.GyroWalk, acc_w == IMU.AccWalk.
 #
-#   gyro  3.8785e-5 rad/s, tau 1000 s -> 1.73452e-6 rad/s^2/sqrt(Hz)
-#   accel 6.0e-3    m/s^2, tau  300 s -> 4.89898e-4 m/s^3/sqrt(Hz)
+# The filter stores a per-sample sigma and both estimators want a continuous
+# density, so each is divided by sqrt(200) for the 200 Hz IMU.  The EKF uses the
+# gyro z and accel x axes only, so those are the axes taken.
 #
-# Cross-check: proprio_estimator.py's `calibrate` measured these back out of the
-# recorded data and obtained gyro 2.9-3.8e-4 on all three axes and accel
-# 3.8-4.0e-3 on Y and Z. The X accel measurement (0.014-0.026) is contaminated by
-# real longitudinal motion and is not used.
+# READ BEFORE QUOTING A RESULT.  Accel x is the direction of travel and its
+# static window is contaminated by real longitudinal motion.  The simulator
+# injects 4.0e-3, every measured value is three to six times that, and all sit
+# close to the inflated 2.0e-2 of the baseline.  So this treatment loosens the
+# GYRO and barely moves the accelerometer.  It equalises what the estimators are
+# told about their sensors; it is not the simulator's true noise.
 #
-# WHY THIS FILE EXISTS. The baseline config inflates these 5-6x, per standard VIO
-# practice. The EKF baseline, by contrast, receives a noise model measured from
-# the data. That asymmetry is an uncontrolled variable in the estimator
-# comparison: it is possible the EKF wins partly because it is better informed
-# about its sensors, not because dead reckoning is better. This file equalises
-# that, changing one factor and nothing else.
+# acc_w has no counterpart: the filter carries no accelerometer-bias random-walk
+# state.  It keeps the value derived from the simulator model (6.0e-3 m/s^2 bias,
+# tau 300 s -> sigma_b*sqrt(2/tau) = 4.89898e-4), the only non-arbitrary choice
+# available, and is the one parameter here not taken from the EKF.
 # ---------------------------------------------------------------------------
 
 # STEREO + IMU (imu:1, num_of_cam:2). SIMULATED WiL rig, Gazebo Fortress.
@@ -158,10 +180,16 @@ keyframe_parallax: 10.0
 # (expressed there as per-sample stddev, i.e. density * sqrt(200 Hz)).
 # Set a few times looser than truth, per the usual VINS advice -- too-large noise
 # degrades gracefully toward stereo-only, too-small does not.
-acc_n: 0.00400222             # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
-gyr_n: 0.000339411            # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
-acc_w: 0.000489898            # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
-gyr_w: 0.00000173452           # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
+# MEASURED values, mean of the four EKF noise models (see the header).
+# Baseline (stereo_imu.yaml), kept for reference:
+# acc_n: 0.02             # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+# gyr_n: 0.002            # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+# acc_w: 0.001            # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
+# gyr_w: 0.0001           # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
+acc_n: 0.018475671    # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+gyr_n: 0.000341640    # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+acc_w: 0.000489898     # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
+gyr_w: 0.00001000    # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
 
 # Exactly the worlds' <gravity>0 0 -9.8</gravity>. The simulated accelerometer
 # has no scale error, so this is true gravity and not the observed-magnitude

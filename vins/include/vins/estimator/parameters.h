@@ -76,6 +76,15 @@ struct VINSOptions {
   int min_feature_distance = 0;
   double ransac_reproj_threshold = 0.0;
   int show_track = 0;
+  /// Mask tracker features beyond this field angle of cam0, in degrees. 0 = off.
+  /// It lives HERE, in the file that describes the camera, because it is a property
+  /// of the lens: VINS normalises every lifted ray by its z component, so on a lens
+  /// wide enough to image past 90 deg those coordinates diverge and flip sign. It was
+  /// first added as a ROS parameter only, and on 2026-11-17 a real-rig run launched
+  /// without that argument diverged exactly as before -- a value that must never be
+  /// forgotten does not belong in the launch command. The ROS parameter still exists
+  /// and overrides this when set >= 0.
+  double fov_mask_deg = 0.0;
   int enable_reverse_optical_flow_check = 0;
   // Process 1 of every `image_skip` incoming (stereo) frames. 2 = legacy half-rate
   // behavior; 1 = process every frame (higher visual rate, better for fast motion).
@@ -96,6 +105,10 @@ struct VINSOptions {
     this->min_feature_distance = (int)fsSettings["min_dist"];
     this->ransac_reproj_threshold = (double)fsSettings["F_threshold"];
     this->show_track = (int)fsSettings["show_track"];
+    // Optional key: an absent FileNode reads as 0.0, which is "no mask" -- the right
+    // default for the pinhole sim configs, which must not be cropped.
+    if (!fsSettings["fov_mask_deg"].empty())
+      this->fov_mask_deg = (double)fsSettings["fov_mask_deg"];
     this->enable_reverse_optical_flow_check = (int)fsSettings["flow_back"];
     if (!fsSettings["image_skip"].empty() && (int)fsSettings["image_skip"] > 0)
       this->image_skip = (int)fsSettings["image_skip"];  // else keep default (2)

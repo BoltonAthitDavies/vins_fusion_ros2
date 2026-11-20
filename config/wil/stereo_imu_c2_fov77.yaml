@@ -1,0 +1,416 @@
+%YAML:1.0
+# ===========================================================================================
+# CANDIDATE CONFIG -- one factor changed from config/wil/stereo_imu.yaml, nothing else.
+# CHANGE:  fov_mask_deg 70 -> 77. Keeps 72 % of the frame; worst feature at |x/z| 4.33, just
+#          below where the normalised plane starts to blow up.
+# EXPECT:  better if the mask is currently throwing away usable wide-baseline features, worse if 4.33 is already too far out. Brackets 70 from the other side.
+#
+# Reference to beat: 0.678 m and 0.708 m ATE, two runs of the unchanged file on
+# dataset_realv7_001 -- so this estimator's own run-to-run spread is ~0.03 m and a
+# candidate must move the number by MORE than that to count. ORB-SLAM3 scores 0.450 m.
+# Delete this file once it has been scored; the result belongs in MEMORY_CLAUDE/README.md.
+# ===========================================================================================
+
+# STEREO + IMU (imu:1, num_of_cam:2). WiL rig.
+#
+# ===========================================================================================
+# THIS FILE IS NOT ENOUGH ON ITS OWN -- PASS fov_mask_deg:=70
+#
+#   ros2 launch vins_fusion_ros2 wil_vins_filter.launch.py \
+#       config_file:=.../config/wil/stereo_imu.yaml fov_mask_deg:=70 use_sim_time:=false \
+#       output_path:=... experiment_id:=... dataset_path:=...
+#
+# fov_mask_deg is a NODE parameter, not a key in this file, so a run that omits it is silently
+# unusable: this rig's ~200 deg fisheye puts 11-35 % of detected corners beyond 77 deg of field
+# angle (90 deg falls 853 px from the principal point, INSIDE the 1920 px frame) and VINS maps
+# every lifted ray to the normalised plane as (x/z, y/z), so those coordinates blow up and flip
+# sign. Every real-rig run before 2026-11-15 diverged on this -- including stereo-only with no
+# IMU at all, which is how it was isolated. Full chain of evidence in
+# vins_fusion_ros2/MEMORY_CLAUDE/README.md section 15. 70 deg keeps 65 % of the frame; the angle
+# itself has ONE data point and is not swept.
+#
+# Measured on dataset_realv7_001 at rate 1.0, scored by script/eval_real_gt.py against the
+# tracker (wheel-correlated offset -3.766 s, r 0.98; marker lever arm still ZERO so every number
+# is "provisional"):
+#
+#   no mask, any arm ................................... diverges (1e8 m)
+#   mask 70, stereo-only (config/wil/stereo.yaml) ...... 0.846 m ATE   path 1.14x
+#   mask 70, extrinsics+td FREE ........................ 1.036-1.307 m path 0.67-0.75x
+#   mask 70, THIS FILE ................................. 0.686 m ATE   path 1.13x   RPE(1s) 0.090
+#   (ORB-SLAM3, loop closing, GPU, same bag) ........... 0.450 m ATE   path 1.07x
+#
+# Still unverified here: the lever arm in body_T_cam0 is zero, the mask angle is unswept, and
+# only realv7_001 has been run with these settings.
+# ===========================================================================================
+#
+# This is the most robust of the three modes VINS supports
+# (Estimator::processInitialization, vins/src/estimator/estimator.cpp:458). Stereo
+# supplies metric scale from the baseline, so unlike mono the IMU is an improvement
+# rather than a requirement -- but it adds high-rate motion between frames, makes
+# roll/pitch observable against gravity, and carries the estimate through the
+# low-texture stretches where pure stereo tracking degrades.
+#
+# IMU STATUS: a real 6-axis unit (RealSense) is now fitted and publishing on the
+# /hwt101ct_yaw_publisher topic name inherited from the old yaw-only module. Verified
+# against dataset/rosbag_realsense_imu_cambaseline95mm (2026-08-14):
+#   - linear_acceleration and angular_velocity both populated, covariances valid
+#   - 199.5 Hz, frame_id "imu_link"
+#   - good excitation for initialization: wheel velocity reaches +/-1.29 m/s and
+#     gyro.z peaks at 1.29 rad/s over the run
+#
+# HISTORICAL (August 2026 RealSense IMU; the current rig's IMU reads 9.8858, see g_norm) --
+# ACCELEROMETER SCALE ERROR:
+#   With the robot stationary the accelerometer magnitude reads 9.2642 m/s^2 (std 0.030)
+#   where true gravity is ~9.81 -- a consistent 5.6% shortfall, steady across the whole
+#   bag (9.2642 at the start, 9.2610 at the end), so it is a calibration error and not
+#   noise. RealSense IMUs ship uncalibrated; run rs-imu-calibration.py and write the
+#   result to the device. Until then g_norm below is set to the OBSERVED magnitude so
+#   VINS's gravity alignment is at least self-consistent -- see the note there.
+imu: 1
+num_of_cam: 2
+
+imu_topic: "/hwt101ct_yaw_publisher"
+
+# The node subscribes as sensor_msgs/Image (see vins_estimator.cpp), while the camera /
+# bag publishes sensor_msgs/CompressedImage on .../image_raw/compressed. Run two
+# image_transport republish nodes to decompress into these raw topics:
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam0/image_raw/compressed -r out:=/cam0/image_raw
+#   ros2 run image_transport republish compressed raw --ros-args \
+#     -r in/compressed:=/cam1/image_raw/compressed -r out:=/cam1/image_raw
+# CAMERA ORDER -- image0 is the LEFT camera, and which bag topic that is changed
+# with the 2026-10-19 RealSense remount. VINS reads these topics ONLY from this
+# file (options->imageTopic()); there is no CLI override and no real-rig launch
+# file, so this is the single lever.
+#
+#   dataset_real_000   (2026-09-14): cam1 RIGHT of cam0 (+19 px) -> cam0 = image0
+#   dataset_realv2_*   (September)  : same era, assumed the same, NOT re-measured
+#                                     (those bags are no longer on disk)
+#   dataset_realv3_000 (2026-10-20): cam1 LEFT  of cam0 (-33 px) -> cam1 = image0
+#
+# body_T_cam1 puts cam1 at +X (right), so with the pre-remount order every correct
+# stereo match triangulates BEHIND the cameras. Measured on realv3: 1 % of matches
+# in front as-is vs 99 % swapped. In ORB-SLAM3 that produced "New Map created with
+# 0 points" and a reset every 3 frames while still extracting ~4000 features --
+# it looks like a feature-extraction failure and is not one.
+#
+# SWAPPED on 2026-10-20 for realv3. To replay a pre-remount bag, swap back.
+# 2026-10-21: swap RETIRED -- topics are cam0/cam1 again and body_T_cam1 now puts
+# cam1 at -X (left), which is where it is. Old bags need the OLD body_T_cam1.
+# Verify any new bag first:  python3 script/check_stereo_side.py <bag> 8
+# cam0_fisheye.yaml and cam1_fisheye.yaml are numerically identical (only
+# camera_name differs), so the calib assignment does not need swapping too.
+image0_topic: "/cam0/image_raw"   # was "/cam0/image_raw" before the remount
+image1_topic: "/cam1/image_raw"   # was "/cam1/image_raw" before the remount
+
+output_path: "/home/ambushee/output/wil_stereo_imu/"   # absolute: "~" is NOT expanded by ofstream
+
+cam0_calib: "cam0_fisheye.yaml"
+cam1_calib: "cam1_fisheye.yaml"
+image_width: 1920
+image_height: 1080
+
+use_gpu: 0
+use_gpu_acc_flow: 0
+use_gpu_ceres: 0
+
+# Extrinsics.
+#
+# IMPORTANT -- the body frame MOVES when imu goes 0 -> 1. In stereo.yaml (imu:0) cam0 is
+# the body origin, so body_T_cam0 is just the camera-optical -> body axis convention.
+# With an IMU the body frame IS the IMU frame, so both matrices below must be
+# IMU -> camera transforms. They are different quantities despite the identical names.
+#
+# ROTATION -- measured from the data, not assumed. Averaging the stationary window of
+# dataset/rosbag_realsense_imu_cambaseline95mm gives an "up" direction in the IMU frame
+# of (+0.029, -0.997, -0.075): gravity lies almost entirely on -Y, so the IMU's +Y axis
+# points DOWN. That is the RealSense convention, x-right / y-down / z-forward, which is
+# the SAME convention as a camera optical frame. So the IMU -> cam0 rotation is
+# approximately IDENTITY.
+#
+# UPDATE 2026-10-19: the RealSense is now mounted rotated 180 deg about its own X
+# axis, so that identity becomes diag(1, -1, -1) -- X unchanged, Y and Z negated.
+# body_T_cam0 below is set accordingly, and body_T_cam1 is left-multiplied by the
+# same rotation (negate rows 2 and 3), which preserves the 0.0936 m baseline and
+# keeps det(R) = +1. Stationary accelerometer should now read
+# (+0.269, +9.236, +0.695) m/s^2 raw instead of (+0.269, -9.236, -0.695); check
+# that first if a run misbehaves.
+#
+# Note this is a real correction, not a cosmetic one: stereo.yaml's matrix rotates
+# camera-optical into an x-forward/y-left/z-up body frame, which was right when cam0 WAS
+# the body origin but is ~90deg wrong now that the body frame is the IMU. Seeding
+# estimate_extrinsic:1 with a 90deg error would likely stop it converging at all.
+# (The residual (+0.029, -, -0.075) is mounting tilt: the unit sits ~4.3deg in pitch and
+# ~1.7deg in roll off level. That is rig tilt, not a frame convention, so it is left for
+# the online refinement rather than baked into the matrix.)
+#
+# TRANSLATION -- still a placeholder. Zero asserts the IMU sits exactly at cam0's
+# optical centre, which it does not. The lever arm couples angular rate into measured
+# acceleration, so leaving it at zero injects a systematic error during turns, and this
+# run reaches 1.29 rad/s of yaw rate. Even a tape-measured offset beats zero.
+#
+# body_T_cam1 = body_T_cam0 * cam0_T_cam1, recomputed for the new body frame. Since
+# body_T_cam0 is now identity, body_T_cam1 IS the calibrated stereo relative
+# (cam0_T_cam1 = inv(old body_T_cam0) * old body_T_cam1). The calibration is unchanged
+# and still checks out: 0.093604 m baseline, 1.0854 deg relative rotation, with the
+# translation on camera +X as a stereo pair should have.
+#
+# TODO before trusting results: calibrate IMU -> cam0 with Kalibr, write it into
+# body_T_cam0, recompute body_T_cam1 = body_T_cam0 * cam0_T_cam1, set
+# estimate_extrinsic to 0.
+#
+# estimate_extrinsic:1 = treat the matrices as an initial guess and refine online.
+# Right setting while the lever arm is a guess, but it also re-optimizes the
+# well-calibrated stereo relative. If the baseline drifts away from 9.36cm in
+# extrinsic_parameter.csv, calibrate properly and go back to 0.
+#
+# 2026-11-17: SET TO 0, and it is the second of the two defects that made every real-rig
+# run useless. AddExtrinsicParameterBlocks frees BOTH camera blocks as soon as the OLDEST
+# window frame exceeds 0.2 m/s -- which a false start-up velocity reaches within a second
+# of the first motion -- and the optimizer then absorbs scale into the baseline. Measured
+# on dataset_realv7_001 (with fov_mask_deg 70, see the header): free 1.307 m ATE and a
+# path only 0.67x ground truth, fixed 0.739 m at 1.13x. It also drifted during the 4.5 s
+# the robot stood still, which fixed extrinsics hold at exactly zero. Go back to 1 only
+# with a measured lever arm in body_T_cam0 and a reason to refine it.
+# PREVIOUS value: estimate_extrinsic: 1
+estimate_extrinsic: 0
+
+# UPDATED 2026-11-17 -- the rotation was wrong by 180 deg, measured, not assumed.
+# On all four real bags, straight segments only (steering centred), the accelerometer's
+# response to a wheel-speed change sits on IMU **z**: start-ups read +0.24 / +0.52 / +0.49
+# / +0.62 m/s^2 (realv6, realv7_000, realv7_002, realv7_001) and the final stops read
+# -0.31 / -0.49 / -0.52, while optical-flow expansion shows the camera travelling FORWARD
+# (optical +z). So IMU +z IS forward. diag(1, -1, -1) maps forward to body -z, i.e. it
+# claims the unit is turned 180 deg about its X axis; it is turned 180 deg about its
+# OPTICAL axis, which is diag(-1, -1, 1). Cross-check: ORB-SLAM3's body-frame velocity on
+# realv7_001 over 7-10 s is (-0.15, 0.00, -0.37) m/s against an IMU strapdown of
+# (+0.18, 0.00, +0.29) -- opposite in x and z, identical in y.
+#
+# THIS CHANGES NO VINS NUMBER TODAY, and do not claim that it does. The old and new
+# matrices differ by diag(-1, 1, -1) = 180 deg about body Y, and Y is the gravity axis on
+# this rig, so the difference is exactly the yaw gauge VINS fixes arbitrarily in
+# initFirstIMUPose (g2R, then yaw zeroed). With the extrinsics fixed and the lever arm
+# zero nothing else couples to it: 0.739 m vs 0.733 m ATE on realv7_001, and the scorer's
+# yaw alignment differs by 179.8 deg, which is the gauge showing up where it should. It is
+# here because it is the physical truth and because it WILL matter the moment the
+# translation below stops being zero. ORB-SLAM3's IMU.T_b_c1 carries the same 180 deg
+# error over a NON-ZERO lever arm (0.26 m below, 0.065 m back), so there it is already
+# wrong by 0.5 m of moment arm and needs its own A/B.
+# PREVIOUS value (2026-10-19 .. 2026-11-16), kept for reference:
+# body_T_cam0: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 1.0,  0.0,  0.0,  0.0,
+#            0.0, -1.0,  0.0,  0.0,
+#            0.0,  0.0, -1.0,  0.0,
+#            0.0,  0.0,  0.0,  1.0]
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [-1.0,  0.0,  0.0,  0.0,
+           0.0, -1.0,  0.0,  0.0,
+           0.0,  0.0,  1.0,  0.0,
+           0.0,  0.0,  0.0,  1.0]
+
+# UPDATED 2026-10-21: body_T_cam1 = body_T_cam0 * cam0_T_cam1, with cam0_T_cam1 the
+# INVERSE of camera_parameters/211026camera1_rot_trans.dat (OpenCV cam1_T_cam0).
+# Topics are cam0 = image0, cam1 = image1 (no swap); cam1 is physically LEFT of
+# cam0, hence x = -0.0897 m. Baseline 0.089723 m, 0.9669 deg.
+# OLD value, kept for reference (derived from the 2026-08-06 .dat, cam1 at +X):
+# body_T_cam1: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 0.9999155119,  0.0066784035,  0.0111520357,  0.0935980368,
+#            0.0065240958, -0.9998832669,  0.0138162526,  0.0010121732,
+#            0.0112430044, -0.0137423283, -0.9998423592, -0.0003943868,
+#            0.0,           0.0,           0.0,           1.0]
+# UPDATED 2026-10-26 from camera_parameters_261026/261026camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0), same derivation as 2026-10-21:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.090258 m, relative rotation 4.72 deg (was 0.089723 m, 0.9669 deg on
+# 2026-10-21). NOTE the relative rotation grew ~5x between the two calibrations of
+# the same bracket; treat as a calibration-quality question until checked on a bag.
+# PREVIOUS value (2026-10-21), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9998579160, -0.0051040575, -0.0160653773, -0.0897173102,
+#          -0.0051169031, -0.9999866208, -0.0007585784, -0.0000049715,
+#          -0.0160612906,  0.0008406756, -0.9998706557, -0.0010314226,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# UPDATED 2026-10-27 from camera_parameters_271026/271026camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0), same derivation as 10-21 and 10-26:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.088418 m, relative rotation 1.29 deg (10-26: 0.090303 m / 4.72 deg; 10-21: 0.089723 m / 0.97 deg).
+# PREVIOUS value (2026-10-26), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9968834966, -0.0031961813, -0.0788230846, -0.0901712571,
+#          -0.0050462668, -0.9997161700, -0.0232833560, -0.0014758000,
+#          -0.0787262944,  0.0236085556, -0.9966166799,  0.0036627138,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# RE-UPDATED 2026-10-27 (13:48 revision): camera_parameters_271026/271026camera1_rot_trans.dat was regenerated after the
+# first 10-27 application; same derivation. Baseline 0.088827 m, relative rotation 1.15 deg.
+# PREVIOUS value (first 10-27 revision of the same .dat), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9998810533,  0.0082047679, -0.0130599033, -0.0883886225,
+#           0.0079883459, -0.9998313217, -0.0165382702, -0.0022479903,
+#          -0.0131933931,  0.0164319760, -0.9997779376,  0.0003213134,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# UPDATED 2026-10-28 from camera_parameters_281026/281026camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0), same derivation as before:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.089028 m, relative rotation 0.86 deg (10-27 13:48: 0.088830 m / 1.15 deg).
+# PREVIOUS value (2026-10-27 13:48 revision), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9999536454,  0.0044054398, -0.0085614905, -0.0888038145,
+#           0.0042535869, -0.9998347419, -0.0176747250, -0.0020094256,
+#          -0.0086379405,  0.0176374887, -0.9998071339,  0.0002223474,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# UPDATED 2026-11-03 from camera_parameters_031126/031126camera1_rot_trans.dat
+# (OpenCV stereoCalibrate output cam1_T_cam0; calibrated 2026-11-03 -- the files carry a
+# 2026-10-31 18:40 timestamp only because the Jetson's clock was wrong), same derivation as before:
+# body_T_cam1 = body_T_cam0 * inverse(R, T), inverse = (R^T, -R^T T).
+# Baseline 0.091710 m, relative rotation 1.61 deg (10-28: 0.089028 m / 0.86 deg). NOTE the
+# baseline grew 2.7 mm and the rotation doubled: treat this as a new mount, not a repeat.
+# PREVIOUS value (2026-10-28), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9999581038,  0.0010089898,  0.0090979406, -0.0889903996,
+#           0.0011175407, -0.9999281605, -0.0119341921, -0.0011567181,
+#           0.0090852455,  0.0119438595, -0.9998873949, -0.0023003115,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+# RE-DERIVED 2026-11-17 for the corrected body_T_cam0 above: body_T_cam1 is
+# left-multiplied by the same R_y(180), i.e. rows 1 and 3 negated. The underlying stereo
+# calibration is NOT touched -- cam0_T_cam1 = inv(body_T_cam0) * body_T_cam1 is bit-identical
+# to before, the baseline stays 0.091710 m and det(R) stays +1. Verify after any edit here:
+#   python3 -c "import cv2,numpy as np; fs=cv2.FileStorage('stereo_imu.yaml',0); \
+#     T0=fs.getNode('body_T_cam0').mat(); T1=fs.getNode('body_T_cam1').mat(); \
+#     print(np.linalg.norm((np.linalg.inv(T0)@T1)[:3,3]))"   # -> 0.09171
+# PREVIOUS value (2026-11-03 calibration under the old body rotation), kept for reference:
+# body_T_cam1: !!opencv-matrix
+#   rows: 4
+#   cols: 4
+#   dt: f
+#   data: [ 0.9999194793,  0.0029322354,  0.0123465315, -0.0916400667,
+#           0.0032399943, -0.9996826761, -0.0249809830, -0.0014828144,
+#           0.0122693635,  0.0250189742, -0.9996116814, -0.0032680838,
+#           0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+body_T_cam1: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [-0.9999194793, -0.0029322354, -0.0123465315,  0.0916400667,
+          0.0032399943, -0.9996826761, -0.0249809830, -0.0014828144,
+         -0.0122693635, -0.0250189742,  0.9996116814,  0.0032680838,
+          0.0000000000,  0.0000000000,  0.0000000000,  1.0000000000]
+
+# Feature tracker
+multiple_thread: 1
+
+# Mask tracker features beyond this field angle of cam0 (degrees). THE SINGLE MOST
+# IMPORTANT VALUE IN THIS FILE for the real rig -- see the block at the top. It lives here
+# rather than in the launch command because on 2026-11-17 a run launched without the
+# command-line argument diverged exactly as the pre-fix runs did. The ROS parameter of the
+# same name still overrides this, including with 0 to switch the mask off deliberately.
+# 70 deg keeps 65 % of the frame; the angle has ONE data point and is not swept.
+fov_mask_deg: 77.0
+# image_skip: process 1 of every N stereo pairs in the BACKEND (the front end still tracks
+# every pair). The comment here used to read "every frame -> deterministic" while the value
+# was 2, which is self-contradictory -- it was copied from config/wil_sim/ where the value
+# really is 1. Measured on dataset_realv7_001, 2026-11-17, everything else as in this file:
+#   image_skip 2 -> 1147 pairs received, 1134 processed, backend queue wait  7.6 ms mean /  207 ms max, ATE 0.733 m
+#   image_skip 1 ->  971 pairs received,  971 processed, backend queue wait 18.5 ms mean /  511 ms max, ATE 0.713 m
+# The ATE difference is inside VINS's own 3-7 % run-to-run spread, but at 1 the backend
+# cannot keep up on this laptop and 15 % FEWER pairs reach the node at all -- the image
+# callback falls behind and frames are lost before the tracker sees them, nondeterministically.
+# Staying at 2 buys determinism and costs nothing measurable. Revisit on faster hardware.
+image_skip: 2
+max_cnt: 150
+min_dist: 30
+freq: 20
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+# Optimization.
+# keyframe_parallax raised from stereo.yaml's 5.0: IMU pre-integration bridges the gap
+# between keyframes, so keyframes can be sparser without losing the motion in between.
+max_solver_time: 0.08
+max_num_iterations: 100
+keyframe_parallax: 10.0
+
+# IMU noise. These set how strongly the optimizer trusts the IMU against visual
+# reprojection, and they are live now that imu:1.
+# Values taken from this repo's own config/realsense_d435i/realsense_stereo_imu_config.yaml
+# rather than stereo.yaml's Bosch BNO055 figures, which were ~68x too tight for a
+# RealSense (acc_n 0.00147 vs 0.1) and would have made the optimizer badly over-trust
+# an IMU that is currently 5.6% out on scale.
+# TODO: re-derive properly with an Allan variance plot from several hours of stationary
+# logging (imu_utils / allan_variance_ros). Until then these are deliberately loose --
+# too-large noise degrades gracefully toward stereo-only, too-small does not.
+# 2026-11-03: acc_n / gyr_n INFLATED x10 to match ORB-SLAM3's real-rig setting (IMU.NoiseAcc 1.0,
+# IMU.NoiseGyro 0.1). On dataset_realv6_000 the previous values made ORB-SLAM3's inertial fusion run
+# away in most runs (1.1-9.6 m) while stereo-only tracked at 0.63 m; with x10 three consecutive ORB
+# runs scored 0.47-0.49 m. This IMU's camera-relative axis signs, lever arm and time offset are
+# unverified, so the optimizer must not over-trust it. Random walks unchanged. Previous values:
+# 2026-11-17: the x10 inflation is REVERTED. It was a workaround for ORB-SLAM3's runaway,
+# and ORB's runaway had a different cause; VINS never needed it. Measured on
+# dataset_realv7_001 with everything else at the settings in this file: x10 gives 0.733 m
+# ATE, these values give 0.686 m, with RPE(1 s) 0.090 m either way. Random walks unchanged
+# (never A/B'd). PREVIOUS values: acc_n 1.0 / gyr_n 0.1.
+# TODO still open: derive all four from an Allan variance plot of several hours stationary.
+acc_n: 0.1              # accelerometer measurement noise density  [m/s^2/sqrt(Hz)]
+gyr_n: 0.01             # gyroscope measurement noise density      [rad/s/sqrt(Hz)]
+acc_w: 0.001            # accelerometer bias random walk           [m/s^3/sqrt(Hz)]
+gyr_w: 0.0001           # gyroscope bias random walk               [rad/s^2/sqrt(Hz)]
+
+# NOT the true local gravity (~9.81). This is the magnitude the accelerometer actually
+# reports at rest, 9.2642 m/s^2, measured over the stationary window of the 2026-08-14
+# bag. VINS uses g_norm as a fixed constraint when it refines gravity during
+# initialization; feeding it 9.81 while the sensor insists on 9.264 makes that step
+# inconsistent and is a good way to get a failed or badly-scaled init.
+# This is a WORKAROUND for the uncalibrated accelerometer, not a fix -- the 5.6% scale
+# error still corrupts dynamic accelerations, where bias estimation only partly absorbs
+# it. Run rs-imu-calibration.py, then set this back to 9.81007.
+# g_norm: 9.2642          # observed, see note above  (August 2026 RealSense; wrong for this rig)
+# 2026-11-04: the rig's IMU (/hwt101ct_yaw_publisher) reads |a| = 9.8858 m/s^2 at rest (measured
+# 29 Oct, see orbslam3_ros2/launch/wil_stereo_imu.launch.py ACCEL_SCALE; 9.878 on the 3 Nov bags).
+# VINS receives the raw samples (no scale applied), so the constraint must be the measured
+# magnitude. The 9.2642 left from the August RealSense made every realv6/realv7 VINS run diverge.
+g_norm: 9.8858          # measured at rest on the current rig, see note above
+
+# Online camera/IMU time-offset estimation. Worth having on for a rig where the camera
+# and IMU are not hardware-triggered together, which is the case here (separate USB
+# camera nodes and a serial IMU).
+#
+# 2026-11-17: SET TO 0, together with estimate_extrinsic above -- the two were changed
+# and measured as one step (0.739 m vs 1.307 m on dataset_realv7_001), so td's own share
+# of that is NOT isolated; re-test it alone if you need to know. Two reasons to hold it:
+# the free estimate diverged to -2.51 s on dataset_realv6_000 and survived every
+# re-initialization (fixed in estimator.cpp on 15 Nov, restored on reset and bounded at
+# 0.2 s, but a bound is not a measurement); and the real offset was measured from the
+# bags by cross-correlating image motion against gyro magnitude at +70..+130 ms, constant
+# across windows, so td: 0.0 is wrong by about 0.1 s and a FIXED 0.1 is the next thing to
+# try. The runs so far keep 0.0 because that is what was measured.
+# PREVIOUS value: estimate_td: 1
+estimate_td: 0
+td: 0.0
+
+load_previous_pose_graph: 0
+pose_graph_save_path: "/home/ambushee/output/wil_stereo_imu/pose_graph/"
+save_image: 1

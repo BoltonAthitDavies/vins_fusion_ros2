@@ -1,5 +1,6 @@
 #include <cv_bridge/cv_bridge.h>
 #include <vins_fusion_ros2/vins_estimator.h>
+#include <vins/camera_models/CameraFactory.h>
 
 #include <algorithm>
 #include <chrono>
@@ -193,6 +194,25 @@ void VinsEstimator::initializeParamters() {
   // frame, p90 61%, max 72.8%. 0.8 sits above the observed maximum, so the valve
   // only catches a runaway detection instead of firing during normal operation.
   max_mask_fraction_ = readParam<double>(this, "max_mask_fraction", 0.8);
+  // Field-of-view limit for the tracker, degrees of field angle; see the header.
+  // Independent of `filter`: it is a property of the lens, not of the scene.
+  // Negative = "not given on the command line", so the config file decides. Any value
+  // >= 0 overrides it, including 0 to switch the mask off for a diagnostic run.
+  const double fov_param = readParam<double>(this, "fov_mask_deg", -1.0);
+  fov_mask_deg_ = fov_param >= 0.0 ? fov_param : options->fov_mask_deg;
+  if (fov_param >= 0.0 && fov_param != options->fov_mask_deg) {
+    RCLCPP_WARN(this->get_logger(),
+                "fov_mask_deg overridden on the command line: %.1f deg instead of the "
+                "config's %.1f deg", fov_param, options->fov_mask_deg);
+  }
+  if (fov_mask_deg_ <= 0.0) {
+    // Not an error -- the sim rig is a pinhole and must not be cropped -- but on a wide
+    // lens an unmasked run is unusable, and that is invisible until the trajectory is
+    // scored. Say it once, at startup, where it is cheap to notice.
+    RCLCPP_INFO(this->get_logger(),
+                "fov_mask_deg is 0: no field-of-view mask. Correct for a pinhole camera; "
+                "on the WiL fisheye rig an unmasked run DIVERGES (record section 15).");
+  }
 
   const auto experiment_id = readParam<std::string>(this, "experiment_id", "");
   const auto dataset_path = readParam<std::string>(this, "dataset_path", "");
@@ -229,6 +249,7 @@ void VinsEstimator::initializeParamters() {
         {"det_max_age_s", std::to_string(det_max_age_)},
         {"mask_dilate_px", std::to_string(mask_dilate_px_)},
         {"max_mask_fraction", std::to_string(max_mask_fraction_)},
+        {"fov_mask_deg", std::to_string(fov_mask_deg_)},
         {"filter_mode", filter_mode_},
         {"motion_iou", std::to_string(motion_iou_)},
         {"motion_min_points", std::to_string(motion_min_points_)},
@@ -483,9 +504,47 @@ void VinsEstimator::submitStereo(const cv::Mat& im0, const cv::Mat& im1,
   image.image1 = im1;
   image.timestamp = t;
   image.mask = maskFor(image.timestamp, image.image0.size());
+  if (fov_mask_deg_ > 0.0) {
+    const cv::Mat fov = fovMaskFor(image.image0.size());
+    if (!fov.empty()) {
+      if (image.mask.empty()) image.mask = fov;
+      else cv::bitwise_and(image.mask, fov, image.mask);
+    }
+  }
   image.vote_boxes = vote_boxes_;
   logMask(stamp);
   estimator_->inputImage(image);
+}
+
+cv::Mat VinsEstimator::fovMaskFor(const cv::Size& size) {
+  if (!fov_mask_.empty() && fov_mask_.size() == size) return fov_mask_;
+  // Trace the fov_mask_deg cone through the calibrated cam0 model: the image of
+  // the ray (sin t cos a, sin t sin a, cos t) for a in [0, 2pi) is the mask
+  // boundary. Exact for any model VINS can load, no assumption about mu == mv.
+  camodocal::CameraPtr cam =
+      camodocal::CameraFactory::instance()->generateCameraFromYamlFile(
+          options->camera_names[0]);
+  if (!cam) {
+    RCLCPP_ERROR(this->get_logger(), "fov_mask_deg set but cam0 model %s could "
+                 "not be loaded; no FOV mask applied", options->camera_names[0].c_str());
+    fov_mask_deg_ = 0.0;
+    return cv::Mat();
+  }
+  const double t = fov_mask_deg_ * M_PI / 180.0;
+  std::vector<cv::Point> poly;
+  for (int i = 0; i < 720; ++i) {
+    const double a = 2.0 * M_PI * i / 720.0;
+    Eigen::Vector3d P(std::sin(t) * std::cos(a), std::sin(t) * std::sin(a), std::cos(t));
+    Eigen::Vector2d p;
+    cam->spaceToPlane(P, p);
+    poly.emplace_back(cvRound(p.x()), cvRound(p.y()));
+  }
+  fov_mask_ = cv::Mat(size, CV_8UC1, cv::Scalar(0));
+  cv::fillPoly(fov_mask_, std::vector<std::vector<cv::Point>>{poly}, cv::Scalar(255));
+  const double kept = cv::countNonZero(fov_mask_) / static_cast<double>(size.area());
+  RCLCPP_INFO(this->get_logger(), "FOV mask: features limited to %.0f deg of field "
+              "angle (%.0f%% of the frame kept)", fov_mask_deg_, 100.0 * kept);
+  return fov_mask_;
 }
 
 void VinsEstimator::onDetections(

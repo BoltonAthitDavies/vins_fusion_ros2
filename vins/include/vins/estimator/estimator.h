@@ -270,6 +270,7 @@ class Estimator {
   std::atomic<std::size_t> total_keyframes_{0};
   std::atomic<std::size_t> total_resets_{0};
   std::atomic<std::size_t> imu_gap_resets_{0};
+  std::atomic<std::size_t> td_runaway_resets_{0};
   std::atomic<std::size_t> failure_resets_{0};
   std::atomic<std::size_t> initialization_events_{0};
   std::atomic<std::size_t> frontend_rows_{0};
@@ -281,6 +282,11 @@ class Estimator {
   Timestamp last_processed_timestamp_{-1.0};
   std::ofstream performance_log_;
   std::ofstream events_log_;
+  /// Per-frame camera-to-body extrinsics as the optimiser holds them. With
+  /// estimate_extrinsic:1 both camera blocks are freed once the oldest window
+  /// frame exceeds 0.2 m/s; the config comments tell the reader to watch the
+  /// baseline in extrinsic_parameter.csv, which this port never wrote.
+  std::ofstream extrinsic_log_;
   std::ofstream frontend_log_;
   std::ofstream backend_log_;
   std::ofstream state_log_;
@@ -307,6 +313,19 @@ class Estimator {
   // tracking. Triggers a clean re-initialization before the next solve, instead of
   // feeding a geometrically-inconsistent IMU factor into Ceres (which evaluates to NaN).
   bool imu_gap_detected = false;
+  /// Camera-IMU time offset the config started with. updateEstimates()
+  /// overwrites options->time_delay with the solver's estimate every frame and
+  /// resetState() never restored it, so a diverged td survived every
+  /// re-initialisation: on dataset_realv6_000 (2026-11-03) td jumped from
+  /// +0.018 s to -2.51 s in one solve, every re-init then read its IMU 2.5 s
+  /// out of step with the images, tripped the IMU-gap check and reset again --
+  /// 217 times in 220 s.
+  double configured_time_delay_ = 0.0;
+  /// |td| beyond this is not a sensor offset. A USB camera against a serial IMU
+  /// sits within tens of milliseconds; 0.2 s is already an order of magnitude
+  /// more than any plausible value and an order of magnitude less than the
+  /// runaway it guards against.
+  static constexpr double MAX_TIME_DELAY = 0.2;
 
   //
   SafeClass<PointCloudData> safe_main_cloud;
